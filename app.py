@@ -388,7 +388,7 @@ def create_excel_formateur_semaine(formateur, data, semaine, mois):
     # Date d'application (week range) centered under mass: B4:E4
     try:
         start_dt = get_week_start_datetime(mois, semaine)
-        end_dt = start_dt + timedelta(days=4)
+        end_dt = start_dt + timedelta(days=5)  # changed to +5 to include samedi
         periode_text = f"Du {start_dt.strftime('%d/%m/%Y')} au {end_dt.strftime('%d/%m/%Y')}"
     except Exception:
         periode_text = ""
@@ -533,7 +533,7 @@ def create_excel_groupe_semaine(groupe, schedule_data, semaine, mois):
     # Date d'application centered under mass: B4:E4
     try:
         start_dt = get_week_start_datetime(mois, semaine)
-        end_dt = start_dt + timedelta(days=4)
+        end_dt = start_dt + timedelta(days=5)  # changed to +5 to include samedi
         periode_text = f"Du {start_dt.strftime('%d/%m/%Y')} au {end_dt.strftime('%d/%m/%Y')}"
     except Exception:
         periode_text = ""
