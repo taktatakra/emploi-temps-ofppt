@@ -1,4 +1,5 @@
 streamlit
-pandas
-openpyxl
-Pillow
+   pandas
+   openpyxl
+   pillow
+   plotly
