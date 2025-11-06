@@ -388,7 +388,7 @@ def create_excel_formateur_semaine(formateur, data, semaine, mois):
     # Date d'application (week range) centered under mass: B4:E4
     try:
         start_dt = get_week_start_datetime(mois, semaine)
-        end_dt = start_dt + timedelta(days=5)  # changed to +5 to include samedi
+        end_dt = start_dt + timedelta(days=5)
         periode_text = f"Du {start_dt.strftime('%d/%m/%Y')} au {end_dt.strftime('%d/%m/%Y')}"
     except Exception:
         periode_text = ""
@@ -533,7 +533,7 @@ def create_excel_groupe_semaine(groupe, schedule_data, semaine, mois):
     # Date d'application centered under mass: B4:E4
     try:
         start_dt = get_week_start_datetime(mois, semaine)
-        end_dt = start_dt + timedelta(days=5)  # changed to +5 to include samedi
+        end_dt = start_dt + timedelta(days=5)
         periode_text = f"Du {start_dt.strftime('%d/%m/%Y')} au {end_dt.strftime('%d/%m/%Y')}"
     except Exception:
         periode_text = ""
@@ -736,7 +736,7 @@ else:
     # Tabs
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["👥 Formateurs","📚 Groupes","🚪 Salles & Conflits","📊 Salles Libres Semaine","📈 Charge par Groupe"])
 
-    # Tab1: Formateurs (same as before)
+    # Tab1: Formateurs
     with tab1:
         st.markdown('<div class="section-header">👥 Consultation / Export par Formateur</div>', unsafe_allow_html=True)
         selected_form = st.selectbox("Sélectionner un formateur", parsed['formateurs'], key="ui_form")
@@ -819,7 +819,7 @@ else:
 
                 st.download_button("💾 Télécharger Pack Excel (Formateurs)", excel_to_bytes(wb_final), f"Pack_Formateurs_{selected_month}_{selected_semaine}.xlsx")
 
-    # Tab2: Groupes (same as before)
+    # Tab2: Groupes
     with tab2:
         st.markdown('<div class="section-header">📚 Consultation / Export par Groupe</div>', unsafe_allow_html=True)
         selected_grp = st.selectbox("Sélectionner un groupe", parsed['groupes'], key="ui_grp")
@@ -936,27 +936,271 @@ else:
                 synth.append({'Jour': jour, 'Créneau': c, 'Horaire': HORAIRES[c], 'Nb Salles Libres': len(libres), 'Salles Disponibles': ', '.join(libres) if libres else 'Aucune'})
         st.dataframe(pd.DataFrame(synth), use_container_width=True)
 
-    # Tab5: Charge par groupe
+    # Tab5: Charge par groupe (REPLACED WITH Plotly DETAILED GRAPH FROM 23.py)
     with tab5:
-        st.markdown('<div class="section-header">📈 Charge par Groupe</div>', unsafe_allow_html=True)
-        charges = []
-        for grp in parsed['groupes']:
-            hrs = 0
-            cnt = 0
-            week_start = get_week_start_datetime(selected_month, selected_semaine)
+        st.markdown('<div class="section-header">📈 Analyse de la Charge par Groupe</div>', unsafe_allow_html=True)
+        st.info(f"📅 Analyse pour : **{selected_month} - {selected_semaine}**")
+
+        # Calculer la masse horaire pour chaque groupe
+        charge_groupes = []
+
+        for groupe in parsed['groupes']:
+            heures_total = 0
+            nb_creneaux = 0
+
             for jour in JOURS:
-                if week_start and is_holiday((week_start + timedelta(days=JOURS.index(jour))).date()):
-                    continue
-                for c in CRENEAUX_JOUR:
-                    key = f"{selected_semaine}-{jour}-{c}"
-                    for f, fd in parsed['schedule'].items():
-                        s = fd['slots'].get(key)
-                        if s and s[0] == grp:
-                            hrs += SLOT_DURATIONS[c]
-                            cnt += 1
+                for creneau in CRENEAUX_JOUR:
+                    slot_key = f"{selected_semaine}-{jour}-{creneau}"
+
+                    for formateur, f_data in parsed['schedule'].items():
+                        slot_data = f_data['slots'].get(slot_key)
+                        if slot_data and slot_data[0] == groupe:
+                            heures_total += SLOT_DURATIONS[creneau]
+                            nb_creneaux += 1
                             break
-            charges.append({'Groupe': grp, 'Heures': hrs, 'Créneaux': cnt})
-        st.dataframe(pd.DataFrame(charges).sort_values('Heures', ascending=False), use_container_width=True)
+
+            charge_groupes.append({
+                'Groupe': groupe,
+                'Heures de Formation': heures_total,
+                'Nombre de Créneaux': nb_creneaux
+            })
+
+        df_charge = pd.DataFrame(charge_groupes).sort_values('Heures de Formation', ascending=False)
+
+        if df_charge.empty:
+            st.info("Aucune donnée de charge disponible pour la semaine sélectionnée.")
+        else:
+            # Calcul de la moyenne
+            moyenne_heures = df_charge['Heures de Formation'].mean()
+
+            # Métriques globales
+            col_met1, col_met2, col_met3, col_met4 = st.columns(4)
+            with col_met1:
+                st.metric("Groupes Total", len(df_charge))
+            with col_met2:
+                st.metric("Charge Moyenne", f"{moyenne_heures:.1f}h")
+            with col_met3:
+                st.metric("Charge Minimale", f"{df_charge['Heures de Formation'].min():.1f}h")
+            with col_met4:
+                st.metric("Charge Maximale", f"{df_charge['Heures de Formation'].max():.1f}h")
+
+            st.markdown("---")
+
+            # Graphique en barres avec catégorisation basée sur la moyenne
+            st.markdown("### 📊 Graphique de la Charge Horaire (par rapport à la moyenne)")
+
+            import plotly.graph_objects as go
+
+            # Créer le graphique avec des couleurs basées sur la moyenne
+            colors = []
+            seuil_bas = moyenne_heures * 0.85  # 15% en dessous de la moyenne
+            seuil_haut = moyenne_heures * 1.15  # 15% au dessus de la moyenne
+
+            for heures in df_charge['Heures de Formation']:
+                if heures > seuil_haut:
+                    colors.append('#d32f2f')  # Rouge: Au-dessus de la moyenne (Trop chargé)
+                elif heures >= seuil_bas and heures <= seuil_haut:
+                    colors.append('#fbc02d')  # Jaune: Proche de la moyenne (Chargé)
+                else:
+                    colors.append('#388e3c')  # Vert: En bas de la moyenne (Normal)
+
+            fig = go.Figure(data=[
+                go.Bar(
+                    x=df_charge['Groupe'],
+                    y=df_charge['Heures de Formation'],
+                    text=df_charge['Heures de Formation'].apply(lambda x: f"{x:.1f}h"),
+                    textposition='outside',
+                    marker=dict(
+                        color=colors,
+                        line=dict(color='#1e5631', width=1.5)
+                    ),
+                    hovertemplate='<b>%{x}</b><br>Heures: %{y:.1f}h<br><extra></extra>'
+                )
+            ])
+
+            # Ajouter une ligne pour la moyenne
+            fig.add_hline(
+                y=moyenne_heures,
+                line_dash="dash",
+                line_color="#1e5631",
+                line_width=2,
+                annotation_text=f"Moyenne: {moyenne_heures:.1f}h",
+                annotation_position="right"
+            )
+
+            # Ajouter des lignes pour les seuils
+            fig.add_hline(
+                y=seuil_haut,
+                line_dash="dot",
+                line_color="#d32f2f",
+                line_width=1,
+                opacity=0.5
+            )
+
+            fig.add_hline(
+                y=seuil_bas,
+                line_dash="dot",
+                line_color="#388e3c",
+                line_width=1,
+                opacity=0.5
+            )
+
+            fig.update_layout(
+                title={
+                    'text': f'Charge Horaire par Groupe - {selected_month} {selected_semaine}',
+                    'x': 0.5,
+                    'xanchor': 'center',
+                    'font': {'size': 18, 'color': '#1e5631', 'family': 'Arial Black'}
+                },
+                xaxis_title='Groupes',
+                yaxis_title='Heures de Formation',
+                plot_bgcolor='white',
+                paper_bgcolor='#f8faf9',
+                height=500,
+                showlegend=False,
+                xaxis=dict(
+                    tickangle=-45,
+                    gridcolor='lightgray'
+                ),
+                yaxis=dict(
+                    gridcolor='lightgray'
+                )
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("---")
+
+            # Tableau détaillé avec catégorisation basée sur la moyenne
+            st.markdown("### 📋 Détail de la Charge par Groupe")
+
+            def categoriser_charge_moyenne(heures, moyenne, seuil_bas, seuil_haut):
+                if heures > seuil_haut:
+                    return "🔴 Trop Chargé"
+                elif heures >= seuil_bas and heures <= seuil_haut:
+                    return "🟡 Chargé"
+                else:
+                    return "🟢 Normal"
+
+            df_charge['Catégorie'] = df_charge['Heures de Formation'].apply(
+                lambda x: categoriser_charge_moyenne(x, moyenne_heures, seuil_bas, seuil_haut)
+            )
+
+            # Ajouter l'écart par rapport à la moyenne
+            df_charge['Écart/Moyenne'] = df_charge['Heures de Formation'] - moyenne_heures
+            df_charge['Écart/Moyenne'] = df_charge['Écart/Moyenne'].apply(lambda x: f"{x:+.1f}h")
+
+            st.dataframe(
+                df_charge,
+                use_container_width=True
+            )
+
+            st.markdown("---")
+
+            # Statistiques par catégorie
+            st.markdown("### 📊 Répartition par Niveau de Charge (basée sur la moyenne)")
+
+            st.info(f"""
+            **Légende:**
+            - 🔴 **Trop Chargé**: > {seuil_haut:.1f}h (au-dessus de +15% de la moyenne)
+            - 🟡 **Chargé**: {seuil_bas:.1f}h - {seuil_haut:.1f}h (proche de la moyenne ±15%)
+            - 🟢 **Normal**: < {seuil_bas:.1f}h (inférieur de -15% de la moyenne - Pas chargé)
+            """)
+
+            col_stat1, col_stat2, col_stat3 = st.columns(3)
+
+            with col_stat1:
+                nb_trop_charge = len(df_charge[df_charge['Heures de Formation'] > seuil_haut])
+                st.markdown(f"""
+                <div class="metric-card" style="border-left-color: #d32f2f;">
+                    <div class="metric-value">{nb_trop_charge}</div>
+                    <div class="metric-label">🔴 Trop Chargés<br/>(Au-dessus moyenne)</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with col_stat2:
+                nb_charge = len(df_charge[(df_charge['Heures de Formation'] >= seuil_bas) & (df_charge['Heures de Formation'] <= seuil_haut)])
+                st.markdown(f"""
+                <div class="metric-card" style="border-left-color: #fbc02d;">
+                    <div class="metric-value">{nb_charge}</div>
+                    <div class="metric-label">🟡 Chargés<br/>(Proche moyenne)</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with col_stat3:
+                nb_normal = len(df_charge[df_charge['Heures de Formation'] < seuil_bas])
+                st.markdown(f"""
+                <div class="metric-card" style="border-left-color: #388e3c;">
+                    <div class="metric-value">{nb_normal}</div>
+                    <div class="metric-label">🟢 Normaux<br/>(En bas moyenne - Pas chargé)</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # Export Excel
+            st.markdown("---")
+            if st.button("📥 Exporter l'Analyse de Charge (Excel)", key="btn_export_charge"):
+                wb_charge = openpyxl.Workbook()
+                ws = wb_charge.active
+                ws.title = "Charge_Groupes"
+                ws.sheet_view.showGridLines = False
+
+                border_thin = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                    top=Side(style='thin'), bottom=Side(style='thin'))
+                header_font = Font(bold=True, size=11, color="FFFFFF")
+                title_font = Font(bold=True, size=14, color="1e5631")
+                header_fill = PatternFill(start_color="2d8659", end_color="2d8659", fill_type="solid")
+                center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+                # Titre
+                ws['A1'] = f'ANALYSE DE CHARGE PAR GROUPE - {selected_month} {selected_semaine}'
+                ws.merge_cells('A1:E1')
+                ws['A1'].font = title_font
+                ws['A1'].alignment = center_align
+                ws.row_dimensions[1].height = 25
+
+                # Info moyenne
+                ws['A2'] = f'Moyenne: {moyenne_heures:.1f}h | Seuils: Normal < {seuil_bas:.1f}h | Chargé: {seuil_bas:.1f}h-{seuil_haut:.1f}h | Trop Chargé > {seuil_haut:.1f}h'
+                ws.merge_cells('A2:E2')
+                ws['A2'].alignment = center_align
+                ws.row_dimensions[2].height = 20
+
+                # En-têtes
+                ws['A4'] = 'Groupe'
+                ws['B4'] = 'Heures de Formation'
+                ws['C4'] = 'Nombre de Créneaux'
+                ws['D4'] = 'Niveau de Charge'
+                ws['E4'] = 'Écart/Moyenne'
+
+                for col in ['A', 'B', 'C', 'D', 'E']:
+                    ws[f'{col}4'].font = header_font
+                    ws[f'{col}4'].fill = header_fill
+                    ws[f'{col}4'].border = border_thin
+                    ws[f'{col}4'].alignment = center_align
+                    ws.column_dimensions[col].width = 25
+
+                # Données
+                row = 5
+                for _, data_row in df_charge.iterrows():
+                    ws[f'A{row}'] = data_row['Groupe']
+                    ws[f'B{row}'] = data_row['Heures de Formation']
+                    ws[f'C{row}'] = data_row['Nombre de Créneaux']
+                    ws[f'D{row}'] = data_row['Catégorie']
+                    ws[f'E{row}'] = data_row['Écart/Moyenne']
+
+                    for col in ['A', 'B', 'C', 'D', 'E']:
+                        ws[f'{col}{row}'].border = border_thin
+                        ws[f'{col}{row}'].alignment = center_align
+
+                    row += 1
+
+                excel_bytes = excel_to_bytes(wb_charge)
+                st.download_button(
+                    "💾 Télécharger l'Analyse",
+                    excel_bytes,
+                    f"Charge_Groupes_{selected_month}_{selected_semaine}.xlsx",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
 
 # Footer
 st.markdown("---")
