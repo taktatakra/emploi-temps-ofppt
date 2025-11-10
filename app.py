@@ -1,3 +1,13 @@
+#!/usr/bin/env python3
+# Streamlit app dérivé du code partagé par l'utilisateur, modifié pour remplacer S1/S2/S3/S4
+# par des plages de dates exactes détectées dans chaque onglet (ou saisies manuellement).
+# Correction: gestion des titres de feuilles invalides pour openpyxl (sanitize_sheet_title).
+#
+# Usage: streamlit run streamlit_app_dates_semaines.py
+#
+# Dépendances: streamlit, pandas, openpyxl, plotly (facultatif pour graphiques existants)
+# Placez Logo_ofppt.png dans le répertoire si vous voulez qu'il apparaisse dans les exports Excel.
+
 import streamlit as st
 import pandas as pd
 import openpyxl
@@ -5,14 +15,14 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.drawing.image import Image
 from openpyxl.utils import get_column_letter
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import copy
 import os
 import re
 
 # Configuration Streamlit
 st.set_page_config(
-    page_title="Gestionnaire d'Emploi du Temps - OFPPT",
+    page_title="Gestionnaire d'Emploi du Temps - OFPPT (Dates exactes)",
     page_icon="📅",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -31,12 +41,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- CONSTANTS ---
-LOGO_FILE_NAME = "Logo_ofppt.png"  # keep this file in project root for Excel exports
-LOGO_URL = "https://www.ofppt.ma/sites/default/files/logo.png"  # used for Streamlit display
+LOGO_FILE_NAME = "Logo_ofppt.png"
+LOGO_URL = "https://www.ofppt.ma/sites/default/files/logo.png"
 LOGO_WIDTH_PIXELS = 70
 LOGO_HEIGHT_PIXELS = 70
 
-SEMAINES = ['S1', 'S2', 'S3', 'S4']
+FALLBACK_SEMAINES = ['S1', 'S2', 'S3', 'S4']
+
 JOURS = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi']
 CRENEAUX_JOUR = ['AM1', 'AM2', 'PM1', 'PM2']
 
@@ -62,7 +73,6 @@ MONTH_TO_NUMBER = {
     'Septembre':9,'Octobre':10,'Novembre':11,'Décembre':12
 }
 
-# Example holidays (edit as needed)
 HOLIDAYS = [
     {'date': datetime(2025,11,6).date(), 'label': 'La Marche Verte'},
     {'date': datetime(2025,11,18).date(), 'label': "Fête de l'Indépendance"},
@@ -75,32 +85,67 @@ HOLIDAYS = [
 HOLIDAY_FILL = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
 HOLIDAY_FONT = Font(bold=True, color="000000")
 
-# --- UTILITIES: dates / holidays ---
-def get_week_start_datetime(mois, semaine, annee=2025):
-    if mois in ['Janvier','Février','Mars','Avril','Mai','Juin','Juillet']:
-        annee = 2026
-    mois_num = MONTH_TO_NUMBER.get(mois)
-    if not mois_num:
-        return None
-    first_day = datetime(annee, mois_num, 1)
-    days_until_monday = (7 - first_day.weekday()) % 7
-    first_monday = first_day + timedelta(days=days_until_monday) if first_day.weekday() != 0 else first_day
-    semaine_num = int(semaine[1:]) - 1
-    return first_monday + timedelta(weeks=semaine_num)
+# --- DATE PARSING HELPERS ---
+ARROW_RE = re.compile(r'\s*(?:→|->|–|-)\s*')
+DATE_FORMATS = [
+    "%d/%m/%Y","%d/%m/%y","%d %b %Y","%d %B %Y","%d %b %y","%d %B %y","%Y-%m-%d","%d.%m.%Y",
+]
 
-def is_holiday(day_date):
-    if day_date is None:
+def try_parse_date(s):
+    if not s or not isinstance(s, str):
         return None
-    if isinstance(day_date, datetime):
-        d = day_date.date()
-    else:
-        d = day_date
-    for h in HOLIDAYS:
-        if h['date'] == d:
-            return h['label']
+    s = s.strip()
+    s = re.sub(r'[^\w\s\-/\.]', ' ', s).strip()
+    for fmt in DATE_FORMATS:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            continue
+    parts = re.split(r'[ \-\\/\.]+', s)
+    if len(parts) >= 3:
+        try:
+            d = int(parts[0]); m = int(parts[1]); y = int(parts[2])
+            if y < 100: y += 2000
+            return datetime(y, m, d).date()
+        except Exception:
+            pass
     return None
 
-# --- PARSING EXCEL input ---
+def parse_date_range_cell(cell):
+    if not cell or not isinstance(cell, str):
+        return (None, None)
+    if '→' in cell or '->' in cell or '–' in cell or '-' in cell:
+        parts = ARROW_RE.split(cell)
+        if len(parts) >= 2:
+            d1 = try_parse_date(parts[0])
+            d2 = try_parse_date(parts[1])
+            return (d1, d2)
+    return (None, None)
+
+# Utility to handle week_start which may be datetime.date or datetime.datetime
+def day_date(week_start, offset_days):
+    if week_start is None:
+        return None
+    d = week_start + timedelta(days=offset_days)
+    if isinstance(d, datetime):
+        return d.date()
+    return d
+
+# Sanitize sheet title for openpyxl: remove invalid chars and truncate to 31 chars
+def sanitize_sheet_title(s, max_len=31):
+    if s is None:
+        return "Sheet1"
+    s = str(s)
+    # invalid characters for Excel sheet names: : \ / ? * [ ]
+    s = re.sub(r'[:\\\/\?\*\[\]]', '_', s)
+    # can't be empty or all spaces
+    s = s.strip() or "sheet"
+    # limit to max_len
+    if len(s) > max_len:
+        s = s[:max_len]
+    return s
+
+# --- PARSING EXCEL input (adapted) ---
 def extract_month_name_from_sheet(sheet_name):
     normalized = sheet_name.replace('Planning_', '').strip()
     for key, value in MONTH_NAMES.items():
@@ -111,19 +156,40 @@ def extract_month_name_from_sheet(sheet_name):
 def find_header_row(df):
     for idx, row in df.iterrows():
         vals = [str(x).strip() for x in row.values if pd.notna(x)]
-        if any(v.lower() == 'formateur' or v.lower() == 'form' for v in vals) and any(c in vals for c in ['AM1','AM2','PM1','PM2']):
+        lowvals = [v.lower() for v in vals]
+        if any(v in ('formateur','form') for v in lowvals) and any(c in vals for c in ['AM1','AM2','PM1','PM2']):
             return idx
     return None
 
 @st.cache_data(show_spinner=False)
 def parse_schedule_sheet(df, sheet_name):
     month_name = extract_month_name_from_sheet(sheet_name)
-    if month_name is None:
-        return None
+    month_label = month_name if month_name else sheet_name
+
     header_idx = find_header_row(df)
     if header_idx is None:
         return None
+
     header_row = df.iloc[header_idx]
+    search_top = max(0, header_idx - 10)
+    found_map = {}
+    for ridx in range(search_top, header_idx):
+        row = df.iloc[ridx].astype(str).tolist()
+        for cidx, cell in enumerate(row):
+            txt = str(cell).strip()
+            if not txt:
+                continue
+            a,b = parse_date_range_cell(txt)
+            if a and b and cidx not in found_map:
+                found_map[cidx] = (txt, a, b)
+    ordered = [found_map[k] for k in sorted(found_map.keys())] if found_map else []
+    if ordered:
+        semaines = [it[0] for it in ordered]
+        week_ranges = {it[0]: {'start': it[1], 'end': it[2]} for it in ordered}
+    else:
+        semaines = FALLBACK_SEMAINES.copy()
+        week_ranges = {}
+
     col_form = -1
     for i, val in enumerate(header_row):
         if pd.notna(val) and str(val).strip().lower() in ('formateur','form'):
@@ -133,24 +199,26 @@ def parse_schedule_sheet(df, sheet_name):
         return None
     col_salle = col_form + 1
     col_start = col_salle + 1
+
     df_data = df.iloc[header_idx+1:].reset_index(drop=True)
+
     schedule = {}
     groupes = set()
     salles = set()
     col_map = {}
     cur = col_start
-    for s in SEMAINES:
+    for s in semaines:
         for j in JOURS:
             for c in CRENEAUX_JOUR:
-                if cur < len(header_row):
-                    col_map[f"{s}-{j}-{c}"] = cur
-                    cur += 1
+                col_map[f"{s}-{j}-{c}"] = cur
+                cur += 1
+
     for _, row in df_data.iterrows():
-        form = str(row.iloc[col_form]).strip()
+        form = str(row.iloc[col_form]).strip() if col_form < len(row) else ''
         salle = str(row.iloc[col_salle]).strip() if col_salle < len(row) else ''
         if not form or form.lower() in ('nan','none',''):
             continue
-        schedule[form] = {'salle': salle, 'slots': {}}
+        schedule.setdefault(form, {'salle': salle, 'slots': {}})
         if salle and salle.lower() not in ('nan','none',''):
             salles.add(salle)
         for key, ci in col_map.items():
@@ -161,7 +229,17 @@ def parse_schedule_sheet(df, sheet_name):
                     if grp and not grp.isdigit() and grp.lower() not in ('nan','none'):
                         schedule[form]['slots'][key] = (grp, salle)
                         groupes.add(grp)
-    return {'month': month_name, 'schedule': schedule, 'formateurs': sorted(schedule.keys()), 'groupes': sorted(list(groupes)), 'salles': sorted(list(salles))}
+
+    return {
+        'month': month_label,
+        'schedule': schedule,
+        'formateurs': sorted(schedule.keys()),
+        'groupes': sorted(list(groupes)),
+        'salles': sorted(list(salles)),
+        'semaines': semaines,
+        'week_ranges': week_ranges,
+        'header_idx': int(header_idx)
+    }
 
 @st.cache_data(show_spinner=False)
 def process_uploaded_excel(uploaded_file):
@@ -171,17 +249,21 @@ def process_uploaded_excel(uploaded_file):
         for sheet_name in xls.sheet_names:
             if sheet_name in IGNORED_SHEETS:
                 continue
-            df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+            df = pd.read_excel(xls, sheet_name=sheet_name, header=None, dtype=str)
+            df = df.fillna('')
             parsed = parse_schedule_sheet(df, sheet_name)
             if parsed:
                 all_data[parsed['month']] = parsed
         sorted_data = {m: all_data[m] for m in MONTH_ORDER if m in all_data}
+        for k, v in all_data.items():
+            if k not in sorted_data:
+                sorted_data[k] = v
         return sorted_data
     except Exception as e:
         st.error(f"Erreur import: {e}")
         return {}
 
-# --- CONFLICT RESOLUTION (kept similar) ---
+# --- Resolve salle conflicts (unchanged) ---
 @st.cache_data(show_spinner=False)
 def resolve_salle_conflits(all_data):
     resolved = copy.deepcopy(all_data)
@@ -189,10 +271,11 @@ def resolve_salle_conflits(all_data):
     all_salles = set()
     for month in resolved.values():
         all_salles.update(month['salles'])
-    HALF_DAY = [('AM1','AM2'), ('PM1','PM2')]
     for month_name, month_data in resolved.items():
         schedule = month_data['schedule']
-        for semaine in SEMAINES:
+        semaines = month_data.get('semaines', FALLBACK_SEMAINES)
+        HALF_DAY = [('AM1','AM2'), ('PM1','PM2')]
+        for semaine in semaines:
             for jour in JOURS:
                 for c1, c2 in HALF_DAY:
                     key1 = f"{semaine}-{jour}-{c1}"
@@ -202,10 +285,10 @@ def resolve_salle_conflits(all_data):
                     for f, fd in schedule.items():
                         s1 = fd['slots'].get(key1)
                         s2 = fd['slots'].get(key2)
-                        if s1 and s1[0]:
-                            occ1.add(fd['salle'])
-                        if s2 and s2[0]:
-                            occ2.add(fd['salle'])
+                        if s1 and s1[1]:
+                            occ1.add(s1[1])
+                        if s2 and s2[1]:
+                            occ2.add(s2[1])
                     libres = all_salles - occ1 - occ2
                     requests = []
                     for form, fd in schedule.items():
@@ -219,7 +302,7 @@ def resolve_salle_conflits(all_data):
                         f = req['formateur']
                         pref = req['pref']
                         assigned = None
-                        if pref not in occupied:
+                        if pref and pref not in occupied:
                             assigned = pref
                         else:
                             candidates = libres - occupied
@@ -231,7 +314,7 @@ def resolve_salle_conflits(all_data):
                                     if grp:
                                         log.append({'Mois': month_name, 'Semaine': semaine, 'Jour_Creneau': f"{jour}-{creneau}", 'Heure': HORAIRES[creneau], 'Formateur': f, 'Groupe': grp, 'Salle_Initiale': pref, 'Salle_Attribuee': assigned})
                             else:
-                                assigned = f"{pref} (CONFLIT NON RESOLU)"
+                                assigned = f"{pref or 'Aucune'} (CONFLIT NON RESOLU)"
                                 for creneau, grp in [(c1, req['g1']), (c2, req['g2'])]:
                                     if grp:
                                         log.append({'Mois': month_name, 'Semaine': semaine, 'Jour_Creneau': f"{jour}-{creneau}", 'Heure': HORAIRES[creneau], 'Formateur': f, 'Groupe': grp, 'Salle_Initiale': pref, 'Salle_Attribuee': 'AUCUNE DISPO'})
@@ -243,17 +326,43 @@ def resolve_salle_conflits(all_data):
                             resolved[month_name]['schedule'][f]['slots'][key2] = (req['g2'], assigned)
     return resolved, pd.DataFrame(log)
 
-# --- UI helper tables (no dates in JOUR column) ---
-def build_schedule_table_for_formateur(formateur_data, semaine, mois):
-    week_start = get_week_start_datetime(mois, semaine)
+# --- UI helper tables ---
+def get_week_start_from_label(mois_label, semaine_label, week_ranges):
+    if week_ranges and semaine_label in week_ranges:
+        return week_ranges[semaine_label]['start']
+    mnum = MONTH_TO_NUMBER.get(mois_label)
+    if mnum:
+        year = 2026 if mnum <= 7 else 2025
+        first_day = datetime(year, mnum, 1)
+        days_until_monday = (7 - first_day.weekday()) % 7
+        first_monday = first_day + timedelta(days=days_until_monday) if first_day.weekday() != 0 else first_day
+        m = re.match(r'S(\d+)', semaine_label, re.I)
+        if m:
+            idx = int(m.group(1)) - 1
+            return (first_monday + timedelta(weeks=idx)).date()
+    return None
+
+def is_holiday(day_date):
+    if day_date is None:
+        return None
+    if isinstance(day_date, datetime):
+        d = day_date.date()
+    else:
+        d = day_date
+    for h in HOLIDAYS:
+        if h['date'] == d:
+            return h['label']
+    return None
+
+def build_schedule_table_for_formateur(formateur_data, semaine_label, mois_label, week_ranges):
+    week_start = get_week_start_from_label(mois_label, semaine_label, week_ranges)
     rows = []
     for i, jour in enumerate(JOURS):
-        holiday = None
-        if week_start:
-            holiday = is_holiday((week_start + timedelta(days=i)).date())
+        d = day_date(week_start, i)
+        holiday = is_holiday(d) if d else None
         row = {'JOUR': jour}
         for c in CRENEAUX_JOUR:
-            key = f"{semaine}-{jour}-{c}"
+            key = f"{semaine_label}-{jour}-{c}"
             if holiday:
                 row[c] = ""
             else:
@@ -263,16 +372,15 @@ def build_schedule_table_for_formateur(formateur_data, semaine, mois):
         rows.append(row)
     return pd.DataFrame(rows)
 
-def build_schedule_table_for_groupe(schedule_data, groupe, semaine, mois):
-    week_start = get_week_start_datetime(mois, semaine)
+def build_schedule_table_for_groupe(schedule_data, groupe, semaine_label, mois_label, week_ranges):
+    week_start = get_week_start_from_label(mois_label, semaine_label, week_ranges)
     rows = []
     for i, jour in enumerate(JOURS):
-        holiday = None
-        if week_start:
-            holiday = is_holiday((week_start + timedelta(days=i)).date())
+        d = day_date(week_start, i)
+        holiday = is_holiday(d) if d else None
         row = {'JOUR': jour}
         for c in CRENEAUX_JOUR:
-            key = f"{semaine}-{jour}-{c}"
+            key = f"{semaine_label}-{jour}-{c}"
             if holiday:
                 row[c] = ""
             else:
@@ -287,30 +395,28 @@ def build_schedule_table_for_groupe(schedule_data, groupe, semaine, mois):
     return pd.DataFrame(rows)
 
 # --- Helpers for hours and logo ---
-def compute_hours_for_formateur(formateur_data, semaine, mois):
+def compute_hours_for_formateur(formateur_data, semaine_label, mois_label, week_ranges):
     heures = 0.0
-    week_start = get_week_start_datetime(mois, semaine)
+    week_start = get_week_start_from_label(mois_label, semaine_label, week_ranges)
     for jour_idx, jour in enumerate(JOURS):
-        if week_start:
-            day_dt = (week_start + timedelta(days=jour_idx)).date()
-            if is_holiday(day_dt):
-                continue
+        day_dt = day_date(week_start, jour_idx)
+        if day_dt and is_holiday(day_dt):
+            continue
         for c in CRENEAUX_JOUR:
-            slot_key = f"{semaine}-{jour}-{c}"
+            slot_key = f"{semaine_label}-{jour}-{c}"
             if slot_key in formateur_data.get('slots', {}):
                 heures += SLOT_DURATIONS.get(c, 0)
     return heures
 
-def compute_hours_for_groupe(schedule_data, groupe, semaine, mois):
+def compute_hours_for_groupe(schedule_data, groupe, semaine_label, mois_label, week_ranges):
     heures = 0.0
-    week_start = get_week_start_datetime(mois, semaine)
+    week_start = get_week_start_from_label(mois_label, semaine_label, week_ranges)
     for jour_idx, jour in enumerate(JOURS):
-        if week_start:
-            day_dt = (week_start + timedelta(days=jour_idx)).date()
-            if is_holiday(day_dt):
-                continue
+        day_dt = day_date(week_start, jour_idx)
+        if day_dt and is_holiday(day_dt):
+            continue
         for c in CRENEAUX_JOUR:
-            slot_key = f"{semaine}-{jour}-{c}"
+            slot_key = f"{semaine_label}-{jour}-{c}"
             for fd in schedule_data.values():
                 slot = fd['slots'].get(slot_key)
                 if slot and slot[0] == groupe:
@@ -328,33 +434,26 @@ def add_logo_if_exists(ws, cell='A1'):
     except Exception:
         pass
 
-# --- EXCEL export helpers ---
+# --- EXCEL export helpers (use sanitize_sheet_title) ---
 def excel_to_bytes(wb):
     output = BytesIO()
     wb.save(output)
     output.seek(0)
     return output.getvalue()
 
-def apply_border_rectangle(ws, start_row, start_col, end_row, end_col, border):
-    for r in range(start_row, end_row+1):
-        for c in range(start_col, end_col+1):
-            ws.cell(row=r, column=c).border = border
-
-# --- EXCEL create for formateur (header moved up by 2 lines across all sheets) ---
-def create_excel_formateur_semaine(formateur, data, semaine, mois):
+def create_excel_formateur_semaine(formateur, data, semaine_label, mois_label, week_ranges):
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = f"{formateur[:20]}-{semaine}"
+    raw_title = f"{formateur[:20]}-{str(semaine_label)[:12]}"
+    ws.title = sanitize_sheet_title(raw_title)
     ws.sheet_view.showGridLines = False
 
-    # page setup (ensure landscape)
+    # page setup
     ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
     ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.page_setup.fitToPage = True
     ws.page_setup.fitToHeight = 1
     ws.page_setup.fitToWidth = 1
-    ws.print_options.horizontalCentered = True
-    ws.print_options.verticalCentered = True
 
     border_thin = Border(left=Side(style='thin', color='000000'),
                          right=Side(style='thin', color='000000'),
@@ -367,29 +466,23 @@ def create_excel_formateur_semaine(formateur, data, semaine, mois):
     center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
     left_align = Alignment(horizontal='left', vertical='center')
 
-    # Add logo if exists (ensures individual file has logo)
     add_logo_if_exists(ws, 'A1')
 
-    # Title moved up by 2 lines: now at B1:E2
     ws.merge_cells('B1:E2')
     ws['B1'] = 'EMPLOI DU TEMPS DE FORMATEUR : FORMATION HYBRIDE - V 1.0'
     ws['B1'].font = title_font
     ws['B1'].alignment = center_align
-    ws.row_dimensions[1].height = 26
-    ws.row_dimensions[2].height = 18
 
-    # MASS HORAIRE centered under title: B3:E3 (moved up)
-    heures = compute_hours_for_formateur(data, semaine, mois)
+    heures = compute_hours_for_formateur(data, semaine_label, mois_label, week_ranges)
     ws.merge_cells('B3:E3')
     ws['B3'] = f'MASSE HORAIRE: {heures:.1f}H/SEMAINE'
     ws['B3'].font = meta_font
     ws['B3'].alignment = center_align
 
-    # Date d'application (week range) centered under mass: B4:E4
     try:
-        start_dt = get_week_start_datetime(mois, semaine)
-        end_dt = start_dt + timedelta(days=5)
-        periode_text = f"Du {start_dt.strftime('%d/%m/%Y')} au {end_dt.strftime('%d/%m/%Y')}"
+        start_dt = get_week_start_from_label(mois_label, semaine_label, week_ranges)
+        end_dt = start_dt + timedelta(days=5) if start_dt else None
+        periode_text = f"Du {start_dt.strftime('%d/%m/%Y')} au {end_dt.strftime('%d/%m/%Y')}" if start_dt and end_dt else ""
     except Exception:
         periode_text = ""
     ws.merge_cells('B4:E4')
@@ -397,24 +490,11 @@ def create_excel_formateur_semaine(formateur, data, semaine, mois):
     ws['B4'].font = meta_font
     ws['B4'].alignment = center_align
 
-    # Meta lines on left (A5..A8) (moved up)
-    ws['A5'] = 'CFP TLRA/IFMLT'
-    ws['A5'].font = meta_font
-    ws['A5'].alignment = left_align
+    ws['A5'] = 'CFP TLRA/IFMLT'; ws['A5'].font = meta_font; ws['A5'].alignment = left_align
+    ws['A6'] = f'Formateur: {formateur}'; ws['A6'].font = meta_font; ws['A6'].alignment = left_align
+    ws['A7'] = f'Semaine: {semaine_label} ({mois_label})'; ws['A7'].font = meta_font; ws['A7'].alignment = left_align
+    ws['A8'] = 'Année de Formation: 2025/2026'; ws['A8'].font = meta_font; ws['A8'].alignment = left_align
 
-    ws['A6'] = f'Formateur: {formateur}'
-    ws['A6'].font = meta_font
-    ws['A6'].alignment = left_align
-
-    ws['A7'] = f'Semaine: {semaine} ({mois})'
-    ws['A7'].font = meta_font
-    ws['A7'].alignment = left_align
-
-    ws['A8'] = 'Année de Formation: 2025/2026'
-    ws['A8'].font = meta_font
-    ws['A8'].alignment = left_align
-
-    # Table header: now row 9 (shifted up by 2)
     header_row = 9
     headers = ['JOUR',
                f'AM1\n{HORAIRES["AM1"]}',
@@ -428,20 +508,14 @@ def create_excel_formateur_semaine(formateur, data, semaine, mois):
         cell.border = border_thin
     ws.row_dimensions[header_row].height = 26
 
-    # Fill rows starting row 10
     row = header_row + 1
-    week_start = get_week_start_datetime(mois, semaine)
+    week_start = get_week_start_from_label(mois_label, semaine_label, week_ranges)
     for j_idx, jour in enumerate(JOURS):
-        # Column A: centered day name
         ws.cell(row=row, column=1, value=jour).font = meta_font
         ws.cell(row=row, column=1).alignment = center_align
         ws.cell(row=row, column=1).border = border_thin
-
-        holiday_label = None
-        if week_start:
-            daydt = (week_start + timedelta(days=j_idx)).date()
-            holiday_label = is_holiday(daydt)
-
+        d = day_date(week_start, j_idx)
+        holiday_label = is_holiday(d) if d else None
         if holiday_label:
             ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=5)
             ws.cell(row=row, column=2, value=holiday_label).font = meta_font
@@ -454,7 +528,7 @@ def create_excel_formateur_semaine(formateur, data, semaine, mois):
                 cell.border = border_thin
         else:
             for ci, creneau in enumerate(CRENEAUX_JOUR, start=2):
-                key = f"{semaine}-{jour}-{creneau}"
+                key = f"{semaine_label}-{jour}-{creneau}"
                 slot = data['slots'].get(key, ('',''))
                 grp, salle = slot
                 text = f"{grp}\n{salle}" if grp and salle else ""
@@ -462,21 +536,14 @@ def create_excel_formateur_semaine(formateur, data, semaine, mois):
                 cell.font = Font(size=10, name='Calibri')
                 cell.alignment = center_align
                 cell.border = border_thin
-
         ws.row_dimensions[row].height = 28
         row += 1
 
-    end_table_row = row - 1
-    # Ensure right border (column E) for all table rows (including header)
-    for r in range(header_row, end_table_row+1):
+    for r in range(header_row, row):
         ws.cell(row=r, column=5).border = border_thin
 
-    # Signature
-    sig_row = end_table_row + 2
-    ws.cell(row=sig_row, column=1, value='Directeur EFP').font = normal_font
-    ws.cell(row=sig_row, column=1).alignment = Alignment(horizontal='left', vertical='center')
-
-    # Column widths
+    sig_row = row + 1
+    ws.cell(row=sig_row, column=1, value='Directeur EFP').font = Font(size=10)
     ws.column_dimensions['A'].width = 18
     ws.column_dimensions['B'].width = 20
     ws.column_dimensions['C'].width = 20
@@ -485,154 +552,61 @@ def create_excel_formateur_semaine(formateur, data, semaine, mois):
 
     return wb
 
-# --- EXCEL create for groupe (header moved up by 2 lines across all sheets) ---
-def create_excel_groupe_semaine(groupe, schedule_data, semaine, mois):
+def create_excel_groupe_semaine(groupe, schedule_data, semaine_label, mois_label, week_ranges):
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = f"{groupe[:20]}-{semaine}"
+    raw_title = f"{groupe[:20]}-{str(semaine_label)[:12]}"
+    ws.title = sanitize_sheet_title(raw_title)
     ws.sheet_view.showGridLines = False
-
-    # ensure landscape
-    ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
-    ws.page_setup.paperSize = ws.PAPERSIZE_A4
-    ws.page_setup.fitToPage = True
-    ws.page_setup.fitToHeight = 1
-    ws.page_setup.fitToWidth = 1
-    ws.print_options.horizontalCentered = True
-    ws.print_options.verticalCentered = True
-
-    border_thin = Border(left=Side(style='thin', color='000000'),
-                         right=Side(style='thin', color='000000'),
-                         top=Side(style='thin', color='000000'),
-                         bottom=Side(style='thin', color='000000'))
-    title_font = Font(bold=True, size=12, name='Calibri')
-    meta_font = Font(bold=True, size=10, name='Calibri')
-    header_font = Font(bold=True, size=11, name='Calibri')
-    normal_font = Font(size=10, name='Calibri')
-    center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
-    left_align = Alignment(horizontal='left', vertical='center')
-
-    # Add logo if exists
     add_logo_if_exists(ws, 'A1')
 
-    # Title: B1:E2 (moved up)
-    ws.merge_cells('B1:E2')
-    ws['B1'] = 'EMPLOI DU TEMPS PAR GROUPE : FORMATION HYBRIDE - V 1.0'
-    ws['B1'].font = title_font
-    ws['B1'].alignment = center_align
-    ws.row_dimensions[1].height = 26
-    ws.row_dimensions[2].height = 18
+    ws.merge_cells('B1:E2'); ws['B1'] = 'EMPLOI DU TEMPS PAR GROUPE : FORMATION HYBRIDE - V 1.0'; ws['B1'].font = Font(bold=True)
+    heures = compute_hours_for_groupe(schedule_data, groupe, semaine_label, mois_label, week_ranges)
+    ws.merge_cells('B3:E3'); ws['B3'] = f'MASSE HORAIRE: {heures:.1f}H/SEMAINE'; ws['B3'].font = Font(bold=True)
 
-    # MASS HORAIRE centered under title: B3:E3
-    heures = compute_hours_for_groupe(schedule_data, groupe, semaine, mois)
-    ws.merge_cells('B3:E3')
-    ws['B3'] = f'MASSE HORAIRE: {heures:.1f}H/SEMAINE'
-    ws['B3'].font = meta_font
-    ws['B3'].alignment = center_align
-
-    # Date d'application centered under mass: B4:E4
-    try:
-        start_dt = get_week_start_datetime(mois, semaine)
-        end_dt = start_dt + timedelta(days=5)
-        periode_text = f"Du {start_dt.strftime('%d/%m/%Y')} au {end_dt.strftime('%d/%m/%Y')}"
-    except Exception:
-        periode_text = ""
-    ws.merge_cells('B4:E4')
-    ws['B4'] = f"Date d'application: {periode_text}" if periode_text else ""
-    ws['B4'].font = meta_font
-    ws['B4'].alignment = center_align
-
-    # Meta lines on left (A5..A8)
-    ws['A5'] = 'CFP TLRA/IFMLT'
-    ws['A5'].font = meta_font
-    ws['A5'].alignment = left_align
-
-    ws['A6'] = f'Groupe: {groupe}'
-    ws['A6'].font = meta_font
-    ws['A6'].alignment = left_align
-
-    ws['A7'] = f'Semaine: {semaine} ({mois})'
-    ws['A7'].font = meta_font
-    ws['A7'].alignment = left_align
-
-    ws['A8'] = 'Année de Formation: 2025/2026'
-    ws['A8'].font = meta_font
-    ws['A8'].alignment = left_align
-
-    # Table header row 9
     header_row = 9
-    headers = ['JOUR',
-               f'AM1\n{HORAIRES["AM1"]}',
-               f'AM2\n{HORAIRES["AM2"]}',
-               f'PM1\n{HORAIRES["PM1"]}',
-               f'PM2\n{HORAIRES["PM2"]}']
+    headers = ['JOUR'] + [f"{c}\n{HORAIRES[c]}" for c in CRENEAUX_JOUR]
     for idx, txt in enumerate(headers, start=1):
         cell = ws.cell(row=header_row, column=idx, value=txt)
-        cell.font = header_font
-        cell.alignment = center_align
-        cell.border = border_thin
-    ws.row_dimensions[header_row].height = 26
-
-    # Fill rows starting row 10
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                             top=Side(style='thin'), bottom=Side(style='thin'))
     row = header_row + 1
-    week_start = get_week_start_datetime(mois, semaine)
+    week_start = get_week_start_from_label(mois_label, semaine_label, week_ranges)
     for j_idx, jour in enumerate(JOURS):
-        ws.cell(row=row, column=1, value=jour).font = meta_font
-        ws.cell(row=row, column=1).alignment = center_align
-        ws.cell(row=row, column=1).border = border_thin
-
-        holiday_label = None
-        if week_start:
-            holiday_label = is_holiday((week_start + timedelta(days=j_idx)).date())
-        if holiday_label:
-            ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=5)
-            ws.cell(row=row, column=2, value=holiday_label).font = meta_font
-            ws.cell(row=row, column=2).alignment = center_align
-            for c in range(2,6):
-                cell = ws.cell(row=row, column=c)
-                cell.fill = HOLIDAY_FILL
-                cell.font = HOLIDAY_FONT
-                cell.alignment = center_align
-                cell.border = border_thin
-        else:
-            for ci, creneau in enumerate(CRENEAUX_JOUR, start=2):
-                key = f"{semaine}-{jour}-{creneau}"
-                info = ""
-                for f, fd in schedule_data.items():
-                    s = fd['slots'].get(key)
-                    if s and s[0] == groupe:
-                        info = f"{f}\n{s[1].replace(' (CONFLIT NON RESOLU)',' (Conflit)')}"
-                        break
-                cell = ws.cell(row=row, column=ci, value=info)
-                cell.font = Font(size=10, name='Calibri')
-                cell.alignment = center_align
-                cell.border = border_thin
-
-        ws.row_dimensions[row].height = 28
+        ws.cell(row=row, column=1, value=jour)
+        d = day_date(week_start, j_idx)
+        for ci, creneau in enumerate(CRENEAUX_JOUR, start=2):
+            key = f"{semaine_label}-{jour}-{creneau}"
+            info = ""
+            for f, fd in schedule_data.items():
+                s = fd['slots'].get(key)
+                if s and s[0] == groupe:
+                    info = f"{f}\n{s[1].replace(' (CONFLIT NON RESOLU)',' (Conflit)')}"
+                    break
+            if d:
+                hol = is_holiday(d)
+                if hol:
+                    info = hol
+            ws.cell(row=row, column=ci, value=info)
         row += 1
-
-    end_table = row - 1
-    for r in range(header_row, end_table+1):
-        ws.cell(row=r, column=5).border = border_thin
-
-    sig_row = end_table + 2
-    ws.cell(row=sig_row, column=1, value='Directeur EFP').font = normal_font
-    ws.cell(row=sig_row, column=1).alignment = Alignment(horizontal='left', vertical='center')
-
+    for r in range(header_row, row):
+        ws.cell(row=r, column=5).border = Border(left=Side(style='thin'), right=Side(style='thin'),
+                                                 top=Side(style='thin'), bottom=Side(style='thin'))
     ws.column_dimensions['A'].width = 18
     ws.column_dimensions['B'].width = 20
     ws.column_dimensions['C'].width = 20
     ws.column_dimensions['D'].width = 20
     ws.column_dimensions['E'].width = 20
-
     return wb
 
 # --- get_available_salles (simple) ---
 @st.cache_data(show_spinner=False)
-def get_available_salles(resolved_schedule, all_salles, semaine, jour, creneau):
+def get_available_salles(resolved_schedule, all_salles, semaine_label, jour, creneau):
     if not all_salles:
         return []
-    slot_key = f"{semaine}-{jour}-{creneau}"
+    slot_key = f"{semaine_label}-{jour}-{creneau}"
     occ = set()
     for fdata in resolved_schedule.values():
         slot = fdata['slots'].get(slot_key)
@@ -680,7 +654,7 @@ st.markdown(f"""
     <div class="ofppt-title">OFPPT</div>
     <div class="ofppt-subtitle">Office de la Formation Professionnelle et de la Promotion du Travail</div>
     <div style="font-size:1.1rem; margin:0.5rem 0;">CFP TLRA/IFMLT</div>
-    <div style="font-size:1.5rem; margin-top:1rem; font-weight:600;">📅 Gestionnaire d'Emploi du Temps</div>
+    <div style="font-size:1.5rem; margin-top:1rem; font-weight:600;">📅 Gestionnaire d'Emploi du Temps (Dates exactes)</div>
     <div class="developer-info">⚡ Développé par <strong>ISMAILI ALAOUI Mohamed</strong></div>
 </div>
 """, unsafe_allow_html=True)
@@ -697,7 +671,7 @@ if st.session_state['resolved_data'] is None or not st.session_state['resolved_d
     with col1:
         st.markdown("### 📥 Format du fichier\n- Fichier Excel (.xlsx/.xls)\n- Onglets: Planning_Mois")
     with col2:
-        st.markdown("### 📊 Structure\n- Colonnes: Formateur, Salle, créneaux\n- 4 semaines (S1-S4)\n- 6 jours × 4 créneaux")
+        st.markdown("### 📊 Structure\n- Colonnes: Formateur, Salle, créneaux\n- Plusieurs semaines (3/4/5) détectées automatiquement par plage de dates si présentes")
 else:
     resolved = st.session_state['resolved_data']
     st.markdown('<div class="section-header">⚙️ Sélection</div>', unsafe_allow_html=True)
@@ -705,18 +679,19 @@ else:
     with col1:
         selected_month = st.selectbox("📅 Mois", list(resolved.keys()))
     with col2:
-        selected_semaine = st.selectbox("📆 Semaine", SEMAINES, index=0)
-    parsed = resolved[selected_month]
+        parsed = resolved[selected_month]
+        semaines_list = parsed.get('semaines', FALLBACK_SEMAINES)
+        selected_semaine = st.selectbox("📆 Semaine (plage de dates)", semaines_list, index=0)
+    week_ranges = parsed.get('week_ranges', {})
 
-    # show holidays summary (but JOUR column displays only names)
-    week_start = get_week_start_datetime(selected_month, selected_semaine)
+    # show holidays summary (JOUR column displays only names)
+    week_start = get_week_start_from_label(selected_month, selected_semaine, week_ranges)
     holidays_week = []
-    if week_start:
-        for i, jour in enumerate(JOURS):
-            d = (week_start + timedelta(days=i)).date()
-            lbl = is_holiday(d)
-            if lbl:
-                holidays_week.append({'jour': jour, 'date': d.strftime('%d/%m/%Y'), 'label': lbl})
+    for i, jour in enumerate(JOURS):
+        d = day_date(week_start, i)
+        lbl = is_holiday(d) if d else None
+        if lbl:
+            holidays_week.append({'jour': jour, 'date': d.strftime('%d/%m/%Y') if d else '', 'label': lbl})
     if holidays_week:
         st.warning("⚠️ Jours fériés cette semaine (annulation des séances correspondantes dans les exports Excel):")
         for h in holidays_week:
@@ -742,10 +717,9 @@ else:
         selected_form = st.selectbox("Sélectionner un formateur", parsed['formateurs'], key="ui_form")
         if selected_form:
             fdata = parsed['schedule'][selected_form]
-            df_view = build_schedule_table_for_formateur(fdata, selected_semaine, selected_month)
+            df_view = build_schedule_table_for_formateur(fdata, selected_semaine, selected_month, week_ranges)
             st.dataframe(df_view, use_container_width=True)
-            # preferred room and hours (excluding holidays)
-            heures = compute_hours_for_formateur(fdata, selected_semaine, selected_month)
+            heures = compute_hours_for_formateur(fdata, selected_semaine, selected_month, week_ranges)
             coll, colr = st.columns([3,1])
             with coll:
                 st.info(f"🏢 Salle préférée: {fdata['salle']}")
@@ -753,140 +727,79 @@ else:
                 st.metric("Heures (hors fériés)", f"{heures:.2f}h")
             st.markdown("### 📄 Export Excel")
             if st.button("📥 Générer Excel (Formateur)", key="btn_export_form"):
-                wb = create_excel_formateur_semaine(selected_form, fdata, selected_semaine, selected_month)
-                st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), f"EDT_Formateur_{selected_form}_{selected_month}_{selected_semaine}.xlsx")
+                wb = create_excel_formateur_semaine(selected_form, fdata, selected_semaine, selected_month, week_ranges)
+                # sanitize filename as well
+                filename = sanitize_sheet_title(f"EDT_Formateur_{selected_form}_{selected_month}_{selected_semaine}", max_len=80) + ".xlsx"
+                st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
 
         st.markdown("---")
         if st.button("📥 Générer Pack Excel (Tous les formateurs)"):
             with st.spinner("Génération pack..."):
                 wb_final = openpyxl.Workbook()
-                # remove default sheet
                 wb_final.remove(wb_final.active)
+                used_names = set()
                 for form in parsed['formateurs']:
-                    wb_temp = create_excel_formateur_semaine(form, parsed['schedule'][form], selected_semaine, selected_month)
+                    wb_temp = create_excel_formateur_semaine(form, parsed['schedule'][form], selected_semaine, selected_month, week_ranges)
                     ws_temp = wb_temp.active
-                    sheet_name = f"{form[:25]}_{selected_semaine}"
+                    sheet_base = sanitize_sheet_title(f"{form[:25]}_{selected_semaine}", max_len=31)
+                    sheet_name = sheet_base
+                    # ensure uniqueness
+                    i = 1
+                    while sheet_name in used_names:
+                        suffix = f"_{i}"
+                        sheet_name = sanitize_sheet_title(sheet_base[:31-len(suffix)] + suffix)
+                        i += 1
+                    used_names.add(sheet_name)
                     ws_new = wb_final.create_sheet(title=sheet_name)
                     ws_new.sheet_view.showGridLines = False
-
-                    # ensure page setup is landscape on new sheet
-                    ws_new.page_setup.orientation = ws_temp.page_setup.orientation
-                    ws_new.page_setup.paperSize = ws_temp.page_setup.paperSize
-                    ws_new.page_setup.fitToPage = True
-                    ws_new.page_setup.fitToHeight = 1
-                    ws_new.page_setup.fitToWidth = 1
-                    ws_new.print_options.horizontalCentered = True
-                    ws_new.print_options.verticalCentered = True
-
-                    # Add logo explicitly to ensure presence in each sheet
-                    add_logo_if_exists(ws_new, 'A1')
-
-                    # Copy cells (value + style)
                     for row_idx in range(1, ws_temp.max_row + 1):
                         for col_idx in range(1, ws_temp.max_column + 1):
                             cell = ws_temp.cell(row=row_idx, column=col_idx)
-                            new_cell = ws_new.cell(row=row_idx, column=col_idx, value=cell.value)
-                            if cell.has_style:
-                                try:
-                                    new_cell.font = copy.copy(cell.font)
-                                    new_cell.fill = copy.copy(cell.fill)
-                                    new_cell.border = copy.copy(cell.border)
-                                    new_cell.alignment = copy.copy(cell.alignment)
-                                except Exception:
-                                    pass
-
-                    # Copy merged cells
-                    for merged in ws_temp.merged_cells.ranges:
-                        try:
-                            ws_new.merge_cells(str(merged))
-                        except Exception:
-                            pass
-
-                    # Copy column widths and row heights
-                    for col_letter, col_dim in ws_temp.column_dimensions.items():
-                        try:
-                            ws_new.column_dimensions[col_letter].width = col_dim.width
-                        except Exception:
-                            pass
-                    for rnum, rd in ws_temp.row_dimensions.items():
-                        try:
-                            ws_new.row_dimensions[rnum].height = rd.height
-                        except Exception:
-                            pass
-
-                    # Re-add logo to A1 to be safe (idempotent)
+                            ws_new.cell(row=row_idx, column=col_idx, value=cell.value)
                     add_logo_if_exists(ws_new, 'A1')
 
-                st.download_button("💾 Télécharger Pack Excel (Formateurs)", excel_to_bytes(wb_final), f"Pack_Formateurs_{selected_month}_{selected_semaine}.xlsx")
+                filename = sanitize_sheet_title(f"Pack_Formateurs_{selected_month}_{selected_semaine}", max_len=80) + ".xlsx"
+                st.download_button("💾 Télécharger Pack Excel (Formateurs)", excel_to_bytes(wb_final), filename)
 
     # Tab2: Groupes
     with tab2:
         st.markdown('<div class="section-header">📚 Consultation / Export par Groupe</div>', unsafe_allow_html=True)
         selected_grp = st.selectbox("Sélectionner un groupe", parsed['groupes'], key="ui_grp")
         if selected_grp:
-            df_grp = build_schedule_table_for_groupe(parsed['schedule'], selected_grp, selected_semaine, selected_month)
+            df_grp = build_schedule_table_for_groupe(parsed['schedule'], selected_grp, selected_semaine, selected_month, week_ranges)
             st.dataframe(df_grp, use_container_width=True)
-            heures_g = compute_hours_for_groupe(parsed['schedule'], selected_grp, selected_semaine, selected_month)
+            heures_g = compute_hours_for_groupe(parsed['schedule'], selected_grp, selected_semaine, selected_month, week_ranges)
             st.metric("Heures (hors fériés)", f"{heures_g:.2f}h")
             if st.button("📥 Générer Excel (Groupe)"):
-                wb = create_excel_groupe_semaine(selected_grp, parsed['schedule'], selected_semaine, selected_month)
-                st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), f"EDT_Groupe_{selected_grp}_{selected_month}_{selected_semaine}.xlsx")
+                wb = create_excel_groupe_semaine(selected_grp, parsed['schedule'], selected_semaine, selected_month, week_ranges)
+                filename = sanitize_sheet_title(f"EDT_Groupe_{selected_grp}_{selected_month}_{selected_semaine}", max_len=80) + ".xlsx"
+                st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
 
         st.markdown("---")
         if st.button("📥 Générer Pack Excel (Tous les groupes)"):
             with st.spinner("Génération pack..."):
                 wb_final = openpyxl.Workbook()
                 wb_final.remove(wb_final.active)
+                used_names = set()
                 for groupe in parsed['groupes']:
-                    wb_temp = create_excel_groupe_semaine(groupe, parsed['schedule'], selected_semaine, selected_month)
+                    wb_temp = create_excel_groupe_semaine(groupe, parsed['schedule'], selected_semaine, selected_month, week_ranges)
                     ws_temp = wb_temp.active
-                    sheet_name = f"{groupe[:25]}_{selected_semaine}"
+                    sheet_base = sanitize_sheet_title(f"{groupe[:25]}_{selected_semaine}", max_len=31)
+                    sheet_name = sheet_base
+                    i = 1
+                    while sheet_name in used_names:
+                        suffix = f"_{i}"
+                        sheet_name = sanitize_sheet_title(sheet_base[:31-len(suffix)] + suffix)
+                        i += 1
+                    used_names.add(sheet_name)
                     ws_new = wb_final.create_sheet(title=sheet_name)
-                    ws_new.sheet_view.showGridLines = False
-
-                    # ensure page setup is landscape on new sheet
-                    ws_new.page_setup.orientation = ws_temp.page_setup.orientation
-                    ws_new.page_setup.paperSize = ws_temp.page_setup.paperSize
-                    ws_new.page_setup.fitToPage = True
-                    ws_new.page_setup.fitToHeight = 1
-                    ws_new.page_setup.fitToWidth = 1
-                    ws_new.print_options.horizontalCentered = True
-                    ws_new.print_options.verticalCentered = True
-
-                    add_logo_if_exists(ws_new, 'A1')
-
                     for row_idx in range(1, ws_temp.max_row + 1):
                         for col_idx in range(1, ws_temp.max_column + 1):
                             cell = ws_temp.cell(row=row_idx, column=col_idx)
-                            new_cell = ws_new.cell(row=row_idx, column=col_idx, value=cell.value)
-                            if cell.has_style:
-                                try:
-                                    new_cell.font = copy.copy(cell.font)
-                                    new_cell.fill = copy.copy(cell.fill)
-                                    new_cell.border = copy.copy(cell.border)
-                                    new_cell.alignment = copy.copy(cell.alignment)
-                                except Exception:
-                                    pass
-
-                    for merged in ws_temp.merged_cells.ranges:
-                        try:
-                            ws_new.merge_cells(str(merged))
-                        except Exception:
-                            pass
-                    for col_letter, col_dim in ws_temp.column_dimensions.items():
-                        try:
-                            ws_new.column_dimensions[col_letter].width = col_dim.width
-                        except Exception:
-                            pass
-                    for rnum, rd in ws_temp.row_dimensions.items():
-                        try:
-                            ws_new.row_dimensions[rnum].height = rd.height
-                        except Exception:
-                            pass
-
+                            ws_new.cell(row=row_idx, column=col_idx, value=cell.value)
                     add_logo_if_exists(ws_new, 'A1')
-
-                st.download_button("💾 Télécharger Pack Excel (Groupes)", excel_to_bytes(wb_final), f"Pack_Groupes_{selected_month}_{selected_semaine}.xlsx")
+                filename = sanitize_sheet_title(f"Pack_Groupes_{selected_month}_{selected_semaine}", max_len=80) + ".xlsx"
+                st.download_button("💾 Télécharger Pack Excel (Groupes)", excel_to_bytes(wb_final), filename)
 
     # Tab3: Salles & Conflits
     with tab3:
@@ -919,13 +832,12 @@ else:
     with tab4:
         st.markdown('<div class="section-header">📊 Synthèse Salles Libres</div>', unsafe_allow_html=True)
         synth = []
-        week_start = get_week_start_datetime(selected_month, selected_semaine)
+        week_start = get_week_start_from_label(selected_month, selected_semaine, week_ranges)
         for jour in JOURS:
             for c in CRENEAUX_JOUR:
                 key = f"{selected_semaine}-{jour}-{c}"
-                holiday = False
-                if week_start and is_holiday((week_start + timedelta(days=JOURS.index(jour))).date()):
-                    holiday = True
+                d = day_date(week_start, JOURS.index(jour))
+                holiday = True if (d and is_holiday(d)) else False
                 occ = set()
                 if not holiday:
                     for f, fd in parsed['schedule'].items():
@@ -936,271 +848,118 @@ else:
                 synth.append({'Jour': jour, 'Créneau': c, 'Horaire': HORAIRES[c], 'Nb Salles Libres': len(libres), 'Salles Disponibles': ', '.join(libres) if libres else 'Aucune'})
         st.dataframe(pd.DataFrame(synth), use_container_width=True)
 
-    # Tab5: Charge par groupe (REPLACED WITH Plotly DETAILED GRAPH FROM 23.py)
+    # Tab5: Charge par groupe
     with tab5:
         st.markdown('<div class="section-header">📈 Analyse de la Charge par Groupe</div>', unsafe_allow_html=True)
         st.info(f"📅 Analyse pour : **{selected_month} - {selected_semaine}**")
 
-        # Calculer la masse horaire pour chaque groupe
         charge_groupes = []
-
         for groupe in parsed['groupes']:
             heures_total = 0
             nb_creneaux = 0
-
             for jour in JOURS:
                 for creneau in CRENEAUX_JOUR:
                     slot_key = f"{selected_semaine}-{jour}-{creneau}"
-
                     for formateur, f_data in parsed['schedule'].items():
                         slot_data = f_data['slots'].get(slot_key)
                         if slot_data and slot_data[0] == groupe:
                             heures_total += SLOT_DURATIONS[creneau]
                             nb_creneaux += 1
                             break
+            charge_groupes.append({'Groupe': groupe, 'Heures de Formation': heures_total, 'Nombre de Créneaux': nb_creneaux})
 
-            charge_groupes.append({
-                'Groupe': groupe,
-                'Heures de Formation': heures_total,
-                'Nombre de Créneaux': nb_creneaux
-            })
-
-        df_charge = pd.DataFrame(charge_groupes).sort_values('Heures de Formation', ascending=False)
-
-        if df_charge.empty:
+        if not charge_groupes:
             st.info("Aucune donnée de charge disponible pour la semaine sélectionnée.")
         else:
-            # Calcul de la moyenne
-            moyenne_heures = df_charge['Heures de Formation'].mean()
+            df_charge = pd.DataFrame(charge_groupes)
+            if 'Heures de Formation' not in df_charge.columns:
+                st.warning("La colonne 'Heures de Formation' est manquante dans les données ; affichage interrompu.")
+                st.dataframe(df_charge, use_container_width=True)
+            else:
+                df_charge = df_charge.sort_values('Heures de Formation', ascending=False)
+                moyenne_heures = df_charge['Heures de Formation'].mean()
+                col_met1, col_met2, col_met3, col_met4 = st.columns(4)
+                with col_met1:
+                    st.metric("Groupes Total", len(df_charge))
+                with col_met2:
+                    st.metric("Charge Moyenne", f"{moyenne_heures:.1f}h")
+                with col_met3:
+                    st.metric("Charge Minimale", f"{df_charge['Heures de Formation'].min():.1f}h")
+                with col_met4:
+                    st.metric("Charge Maximale", f"{df_charge['Heures de Formation'].max():.1f}h")
 
-            # Métriques globales
-            col_met1, col_met2, col_met3, col_met4 = st.columns(4)
-            with col_met1:
-                st.metric("Groupes Total", len(df_charge))
-            with col_met2:
-                st.metric("Charge Moyenne", f"{moyenne_heures:.1f}h")
-            with col_met3:
-                st.metric("Charge Minimale", f"{df_charge['Heures de Formation'].min():.1f}h")
-            with col_met4:
-                st.metric("Charge Maximale", f"{df_charge['Heures de Formation'].max():.1f}h")
-
-            st.markdown("---")
-
-            # Graphique en barres avec catégorisation basée sur la moyenne
-            st.markdown("### 📊 Graphique de la Charge Horaire (par rapport à la moyenne)")
-
-            import plotly.graph_objects as go
-
-            # Créer le graphique avec des couleurs basées sur la moyenne
-            colors = []
-            seuil_bas = moyenne_heures * 0.85  # 15% en dessous de la moyenne
-            seuil_haut = moyenne_heures * 1.15  # 15% au dessus de la moyenne
-
-            for heures in df_charge['Heures de Formation']:
-                if heures > seuil_haut:
-                    colors.append('#d32f2f')  # Rouge: Au-dessus de la moyenne (Trop chargé)
-                elif heures >= seuil_bas and heures <= seuil_haut:
-                    colors.append('#fbc02d')  # Jaune: Proche de la moyenne (Chargé)
-                else:
-                    colors.append('#388e3c')  # Vert: En bas de la moyenne (Normal)
-
-            fig = go.Figure(data=[
-                go.Bar(
-                    x=df_charge['Groupe'],
-                    y=df_charge['Heures de Formation'],
-                    text=df_charge['Heures de Formation'].apply(lambda x: f"{x:.1f}h"),
-                    textposition='outside',
-                    marker=dict(
-                        color=colors,
-                        line=dict(color='#1e5631', width=1.5)
-                    ),
-                    hovertemplate='<b>%{x}</b><br>Heures: %{y:.1f}h<br><extra></extra>'
-                )
-            ])
-
-            # Ajouter une ligne pour la moyenne
-            fig.add_hline(
-                y=moyenne_heures,
-                line_dash="dash",
-                line_color="#1e5631",
-                line_width=2,
-                annotation_text=f"Moyenne: {moyenne_heures:.1f}h",
-                annotation_position="right"
-            )
-
-            # Ajouter des lignes pour les seuils
-            fig.add_hline(
-                y=seuil_haut,
-                line_dash="dot",
-                line_color="#d32f2f",
-                line_width=1,
-                opacity=0.5
-            )
-
-            fig.add_hline(
-                y=seuil_bas,
-                line_dash="dot",
-                line_color="#388e3c",
-                line_width=1,
-                opacity=0.5
-            )
-
-            fig.update_layout(
-                title={
-                    'text': f'Charge Horaire par Groupe - {selected_month} {selected_semaine}',
-                    'x': 0.5,
-                    'xanchor': 'center',
-                    'font': {'size': 18, 'color': '#1e5631', 'family': 'Arial Black'}
-                },
-                xaxis_title='Groupes',
-                yaxis_title='Heures de Formation',
-                plot_bgcolor='white',
-                paper_bgcolor='#f8faf9',
-                height=500,
-                showlegend=False,
-                xaxis=dict(
-                    tickangle=-45,
-                    gridcolor='lightgray'
-                ),
-                yaxis=dict(
-                    gridcolor='lightgray'
-                )
-            )
-
-            st.plotly_chart(fig, use_container_width=True)
-
-            st.markdown("---")
-
-            # Tableau détaillé avec catégorisation basée sur la moyenne
-            st.markdown("### 📋 Détail de la Charge par Groupe")
-
-            def categoriser_charge_moyenne(heures, moyenne, seuil_bas, seuil_haut):
-                if heures > seuil_haut:
-                    return "🔴 Trop Chargé"
-                elif heures >= seuil_bas and heures <= seuil_haut:
-                    return "🟡 Chargé"
-                else:
-                    return "🟢 Normal"
-
-            df_charge['Catégorie'] = df_charge['Heures de Formation'].apply(
-                lambda x: categoriser_charge_moyenne(x, moyenne_heures, seuil_bas, seuil_haut)
-            )
-
-            # Ajouter l'écart par rapport à la moyenne
-            df_charge['Écart/Moyenne'] = df_charge['Heures de Formation'] - moyenne_heures
-            df_charge['Écart/Moyenne'] = df_charge['Écart/Moyenne'].apply(lambda x: f"{x:+.1f}h")
-
-            st.dataframe(
-                df_charge,
-                use_container_width=True
-            )
-
-            st.markdown("---")
-
-            # Statistiques par catégorie
-            st.markdown("### 📊 Répartition par Niveau de Charge (basée sur la moyenne)")
-
-            st.info(f"""
-            **Légende:**
-            - 🔴 **Trop Chargé**: > {seuil_haut:.1f}h (au-dessus de +15% de la moyenne)
-            - 🟡 **Chargé**: {seuil_bas:.1f}h - {seuil_haut:.1f}h (proche de la moyenne ±15%)
-            - 🟢 **Normal**: < {seuil_bas:.1f}h (inférieur de -15% de la moyenne - Pas chargé)
-            """)
-
-            col_stat1, col_stat2, col_stat3 = st.columns(3)
-
-            with col_stat1:
-                nb_trop_charge = len(df_charge[df_charge['Heures de Formation'] > seuil_haut])
-                st.markdown(f"""
-                <div class="metric-card" style="border-left-color: #d32f2f;">
-                    <div class="metric-value">{nb_trop_charge}</div>
-                    <div class="metric-label">🔴 Trop Chargés<br/>(Au-dessus moyenne)</div>
-                </div>
-                """, unsafe_allow_html=True)
-
-            with col_stat2:
-                nb_charge = len(df_charge[(df_charge['Heures de Formation'] >= seuil_bas) & (df_charge['Heures de Formation'] <= seuil_haut)])
-                st.markdown(f"""
-                <div class="metric-card" style="border-left-color: #fbc02d;">
-                    <div class="metric-value">{nb_charge}</div>
-                    <div class="metric-label">🟡 Chargés<br/>(Proche moyenne)</div>
-                </div>
-                """, unsafe_allow_html=True)
-
-            with col_stat3:
-                nb_normal = len(df_charge[df_charge['Heures de Formation'] < seuil_bas])
-                st.markdown(f"""
-                <div class="metric-card" style="border-left-color: #388e3c;">
-                    <div class="metric-value">{nb_normal}</div>
-                    <div class="metric-label">🟢 Normaux<br/>(En bas moyenne - Pas chargé)</div>
-                </div>
-                """, unsafe_allow_html=True)
-
-            # Export Excel
-            st.markdown("---")
-            if st.button("📥 Exporter l'Analyse de Charge (Excel)", key="btn_export_charge"):
-                wb_charge = openpyxl.Workbook()
-                ws = wb_charge.active
-                ws.title = "Charge_Groupes"
-                ws.sheet_view.showGridLines = False
-
-                border_thin = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                    top=Side(style='thin'), bottom=Side(style='thin'))
-                header_font = Font(bold=True, size=11, color="FFFFFF")
-                title_font = Font(bold=True, size=14, color="1e5631")
-                header_fill = PatternFill(start_color="2d8659", end_color="2d8659", fill_type="solid")
-                center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
-
-                # Titre
-                ws['A1'] = f'ANALYSE DE CHARGE PAR GROUPE - {selected_month} {selected_semaine}'
-                ws.merge_cells('A1:E1')
-                ws['A1'].font = title_font
-                ws['A1'].alignment = center_align
-                ws.row_dimensions[1].height = 25
-
-                # Info moyenne
-                ws['A2'] = f'Moyenne: {moyenne_heures:.1f}h | Seuils: Normal < {seuil_bas:.1f}h | Chargé: {seuil_bas:.1f}h-{seuil_haut:.1f}h | Trop Chargé > {seuil_haut:.1f}h'
-                ws.merge_cells('A2:E2')
-                ws['A2'].alignment = center_align
-                ws.row_dimensions[2].height = 20
-
-                # En-têtes
-                ws['A4'] = 'Groupe'
-                ws['B4'] = 'Heures de Formation'
-                ws['C4'] = 'Nombre de Créneaux'
-                ws['D4'] = 'Niveau de Charge'
-                ws['E4'] = 'Écart/Moyenne'
-
-                for col in ['A', 'B', 'C', 'D', 'E']:
-                    ws[f'{col}4'].font = header_font
-                    ws[f'{col}4'].fill = header_fill
-                    ws[f'{col}4'].border = border_thin
-                    ws[f'{col}4'].alignment = center_align
-                    ws.column_dimensions[col].width = 25
-
-                # Données
-                row = 5
-                for _, data_row in df_charge.iterrows():
-                    ws[f'A{row}'] = data_row['Groupe']
-                    ws[f'B{row}'] = data_row['Heures de Formation']
-                    ws[f'C{row}'] = data_row['Nombre de Créneaux']
-                    ws[f'D{row}'] = data_row['Catégorie']
-                    ws[f'E{row}'] = data_row['Écart/Moyenne']
-
-                    for col in ['A', 'B', 'C', 'D', 'E']:
-                        ws[f'{col}{row}'].border = border_thin
-                        ws[f'{col}{row}'].alignment = center_align
-
-                    row += 1
-
-                excel_bytes = excel_to_bytes(wb_charge)
-                st.download_button(
-                    "💾 Télécharger l'Analyse",
-                    excel_bytes,
-                    f"Charge_Groupes_{selected_month}_{selected_semaine}.xlsx",
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
+                import plotly.graph_objects as go
+                colors = []
+                seuil_bas = moyenne_heures * 0.85
+                seuil_haut = moyenne_heures * 1.15
+                for heures in df_charge['Heures de Formation']:
+                    if heures > seuil_haut:
+                        colors.append('#d32f2f')
+                    elif heures >= seuil_bas and heures <= seuil_haut:
+                        colors.append('#fbc02d')
+                    else:
+                        colors.append('#388e3c')
+                fig = go.Figure(data=[go.Bar(x=df_charge['Groupe'], y=df_charge['Heures de Formation'], text=df_charge['Heures de Formation'].apply(lambda x: f"{x:.1f}h"), textposition='outside', marker=dict(color=colors, line=dict(color='#1e5631', width=1.5)), hovertemplate='<b>%{x}</b><br>Heures: %{y:.1f}h<br><extra></extra>')])
+                fig.add_hline(y=moyenne_heures, line_dash="dash", line_color="#1e5631", annotation_text=f"Moyenne: {moyenne_heures:.1f}h", annotation_position="right")
+                fig.add_hline(y=seuil_haut, line_dash="dot", line_color="#d32f2f", opacity=0.5)
+                fig.add_hline(y=seuil_bas, line_dash="dot", line_color="#388e3c", opacity=0.5)
+                fig.update_layout(title={'text': f'Charge Horaire par Groupe - {selected_month} {selected_semaine}', 'x': 0.5}, xaxis_title='Groupes', yaxis_title='Heures de Formation', plot_bgcolor='white', paper_bgcolor='#f8faf9', height=500, showlegend=False, xaxis=dict(tickangle=-45, gridcolor='lightgray'), yaxis=dict(gridcolor='lightgray'))
+                st.plotly_chart(fig, use_container_width=True)
+                st.markdown("---")
+                def categoriser_charge_moyenne(heures, moyenne, seuil_bas, seuil_haut):
+                    if heures > seuil_haut:
+                        return "🔴 Trop Chargé"
+                    elif heures >= seuil_bas and heures <= seuil_haut:
+                        return "🟡 Chargé"
+                    else:
+                        return "🟢 Normal"
+                df_charge['Catégorie'] = df_charge['Heures de Formation'].apply(lambda x: categoriser_charge_moyenne(x, moyenne_heures, seuil_bas, seuil_haut))
+                df_charge['Écart/Moyenne'] = df_charge['Heures de Formation'] - moyenne_heures
+                df_charge['Écart/Moyenne'] = df_charge['Écart/Moyenne'].apply(lambda x: f"{x:+.1f}h")
+                st.dataframe(df_charge, use_container_width=True)
+                st.markdown("---")
+                st.info(f"""
+                **Légende:**
+                - 🔴 **Trop Chargé**: > {seuil_haut:.1f}h (au-dessus de +15% de la moyenne)
+                - 🟡 **Chargé**: {seuil_bas:.1f}h - {seuil_haut:.1f}h (proche de la moyenne ±15%)
+                - 🟢 **Normal**: < {seuil_bas:.1f}h (inférieur de -15% de la moyenne - Pas chargé)
+                """)
+                col_stat1, col_stat2, col_stat3 = st.columns(3)
+                with col_stat1:
+                    nb_trop_charge = len(df_charge[df_charge['Heures de Formation'] > seuil_haut])
+                    st.markdown(f"""<div class="metric-card" style="border-left-color: #d32f2f;"><div class="metric-value">{nb_trop_charge}</div><div class="metric-label">🔴 Trop Chargés<br/>(Au-dessus moyenne)</div></div>""", unsafe_allow_html=True)
+                with col_stat2:
+                    nb_charge = len(df_charge[(df_charge['Heures de Formation'] >= seuil_bas) & (df_charge['Heures de Formation'] <= seuil_haut)])
+                    st.markdown(f"""<div class="metric-card" style="border-left-color: #fbc02d;"><div class="metric-value">{nb_charge}</div><div class="metric-label">🟡 Chargés<br/>(Proche moyenne)</div></div>""", unsafe_allow_html=True)
+                with col_stat3:
+                    nb_normal = len(df_charge[df_charge['Heures de Formation'] < seuil_bas])
+                    st.markdown(f"""<div class="metric-card" style="border-left-color: #388e3c;"><div class="metric-value">{nb_normal}</div><div class="metric-label">🟢 Normaux<br/>(En bas de la moyenne - Pas chargé)</div></div>""", unsafe_allow_html=True)
+                st.markdown("---")
+                if st.button("📥 Exporter l'Analyse de Charge (Excel)", key="btn_export_charge"):
+                    wb_charge = openpyxl.Workbook()
+                    ws = wb_charge.active
+                    ws.title = sanitize_sheet_title("Charge_Groupes")
+                    ws.sheet_view.showGridLines = False
+                    border_thin = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+                    header_font = Font(bold=True, size=11, color="FFFFFF")
+                    title_font = Font(bold=True, size=14, color="1e5631")
+                    header_fill = PatternFill(start_color="2d8659", end_color="2d8659", fill_type="solid")
+                    center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                    ws['A1'] = f'ANALYSE DE CHARGE PAR GROUPE - {selected_month} {selected_semaine}'
+                    ws.merge_cells('A1:E1'); ws['A1'].font = title_font; ws['A1'].alignment = center_align; ws.row_dimensions[1].height = 25
+                    ws['A2'] = f'Moyenne: {moyenne_heures:.1f}h | Seuils: Normal < {seuil_bas:.1f}h | Chargé: {seuil_bas:.1f}h-{seuil_haut:.1f}h | Trop Chargé > {seuil_haut:.1f}h'
+                    ws.merge_cells('A2:E2'); ws['A2'].alignment = center_align; ws.row_dimensions[2].height = 20
+                    ws['A4'] = 'Groupe'; ws['B4'] = 'Heures de Formation'; ws['C4'] = 'Nombre de Créneaux'; ws['D4'] = 'Niveau de Charge'; ws['E4'] = 'Écart/Moyenne'
+                    for col in ['A','B','C','D','E']:
+                        ws[f'{col}4'].font = header_font; ws[f'{col}4'].fill = header_fill; ws[f'{col}4'].border = border_thin; ws[f'{col}4'].alignment = center_align; ws.column_dimensions[col].width = 25
+                    row = 5
+                    for _, data_row in df_charge.iterrows():
+                        ws[f'A{row}'] = data_row['Groupe']; ws[f'B{row}'] = data_row['Heures de Formation']; ws[f'C{row}'] = data_row['Nombre de Créneaux']; ws[f'D{row}'] = data_row['Catégorie']; ws[f'E{row}'] = data_row['Écart/Moyenne']
+                        for col in ['A','B','C','D','E']:
+                            ws[f'{col}{row}'].border = border_thin; ws[f'{col}{row}'].alignment = center_align
+                        row += 1
+                    excel_bytes = excel_to_bytes(wb_charge)
+                    st.download_button("💾 Télécharger l'Analyse", excel_bytes, f"Charge_Groupes_{selected_month}_{selected_semaine}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
 # Footer
 st.markdown("---")
