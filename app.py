@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Streamlit app dérivé du code partagé par l'utilisateur, modifié pour remplacer S1/S2/S3/S4
-# par des plages de dates exactes détectées dans chaque onglet (ou saisies manuellement).
+# par des plages de dates exactes détectées dans chaque onglets (ou saisies manuellement).
 # Correction: gestion des titres de feuilles invalides pour openpyxl (sanitize_sheet_title).
 #
 # Usage: streamlit run streamlit_app_dates_semaines.py
@@ -441,66 +441,383 @@ def excel_to_bytes(wb):
     output.seek(0)
     return output.getvalue()
 
-def create_excel_formateur_semaine(formateur, data, semaine_label, mois_label, week_ranges):
+# Utility to clear borders on specific rows (used to remove the grid for signature rows)
+def clear_row_borders(ws, row_idx, start_col=1, end_col=5):
+    empty_border = Border()
+    for c in range(start_col, end_col + 1):
+        try:
+            ws.cell(row=row_idx, column=c).border = empty_border
+        except Exception:
+            pass
+
+# Centralized style helpers for the template
+def _apply_template_title(ws, title_text, heures_text, periode_text, left_meta, right_meta):
+    # title B1:E2
+    center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    title_font = Font(bold=True, size=14, name='Calibri')
+    meta_font_bold = Font(bold=True, size=10, name='Calibri')
+    ws.merge_cells('B1:E2')
+    ws['B1'] = title_text
+    ws['B1'].font = title_font
+    ws['B1'].alignment = center_align
+
+    # MASSE HORAIRE
+    ws.merge_cells('B3:E3')
+    ws['B3'] = heures_text
+    ws['B3'].font = meta_font_bold
+    ws['B3'].alignment = center_align
+
+    # Date d'application - render in bold per user request
+    ws.merge_cells('B4:E4')
+    ws['B4'] = periode_text
+    ws['B4'].font = meta_font_bold  # bold
+    ws['B4'].alignment = center_align
+
+    # Left meta: list of tuples (cell, value)
+    for idx, (cell, value) in enumerate(left_meta, start=5):
+        ws[cell] = value
+        ws[cell].font = meta_font_bold
+        ws[cell].alignment = Alignment(horizontal='left', vertical='center')
+
+    # Right meta: write on column E rows 5..8 (bold, right-aligned)
+    for idx, val in enumerate(right_meta, start=5):
+        ws[f'E{idx}'] = val
+        ws[f'E{idx}'].font = meta_font_bold
+        ws[f'E{idx}'].alignment = Alignment(horizontal='right', vertical='center')
+
+def _draw_table_borders(ws, start_row, end_row, start_col=1, end_col=5, meta_top_row=5):
+    """
+    Draw borders for the rectangular table.
+    NOTE: The function assumes end_row is the last row of the TABLE (not including signature rows).
+    It will draw borders for the table area from start_row..end_row and columns start_col..end_col.
+    The left vertical border is extended up to meta_top_row, but the right vertical border is NOT
+    extended into the metadata area to avoid showing a vertical grid near "Niveau: ...".
+    """
+    thin_side = Side(style='thin', color='000000')
+    border_all = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+
+    # Apply full rectangle borders for table area
+    for r in range(start_row, end_row + 1):
+        for c in range(start_col, end_col + 1):
+            try:
+                ws.cell(row=r, column=c).border = border_all
+            except Exception:
+                pass
+
+    # Ensure the LEFT vertical border is drawn from meta_top_row to end_row (extend into metadata area)
+    for r in range(meta_top_row, end_row + 1):
+        left_cell = ws.cell(row=r, column=start_col)
+        try:
+            existing = left_cell.border
+            left_cell.border = Border(
+                left=thin_side,
+                right=existing.right if existing else thin_side,
+                top=existing.top if existing else thin_side,
+                bottom=existing.bottom if existing else thin_side
+            )
+        except Exception:
+            left_cell.border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+
+    # RIGHT vertical border: only from start_row to end_row (no extension into metadata)
+    for r in range(start_row, end_row + 1):
+        right_cell = ws.cell(row=r, column=end_col)
+        try:
+            existing = right_cell.border
+            right_cell.border = Border(
+                left=existing.left if existing else thin_side,
+                right=thin_side,
+                top=existing.top if existing else thin_side,
+                bottom=existing.bottom if existing else thin_side
+            )
+        except Exception:
+            right_cell.border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+
+    # Additionally, ensure that any merged ranges that intersect the table have borders on their edges
+    try:
+        for m in ws.merged_cells.ranges:
+            min_col, min_row, max_col, max_row = m.bounds
+            if max_row >= start_row and min_row <= end_row and not (max_col < start_col or min_col > end_col):
+                # clip to table bounds
+                r1 = max(min_row, start_row)
+                r2 = min(max_row, end_row)
+                c1 = max(min_col, start_col)
+                c2 = min(max_col, end_col)
+                for rr in range(r1, r2 + 1):
+                    for cc in range(c1, c2 + 1):
+                        cell = ws.cell(row=rr, column=cc)
+                        cell.border = border_all
+    except Exception:
+        pass
+
+# Utility: copy sheet content (values + styles + merges + sizes) from ws_src to ws_dest
+def copy_sheet(ws_src, ws_dest):
+    """
+    Copy the content of ws_src into ws_dest:
+     - copy merged cell ranges
+     - copy column widths and row heights
+     - copy cell values and styles for real Cell objects
+     - skip MergedCell objects (their content/appearance preserved by merged ranges copy)
+     - re-add logo if available
+     - copy page_setup attributes (orientation, etc.)
+     - ensure borders are closed only for the real table area (not signature rows)
+    """
+    from openpyxl.cell.cell import MergedCell
+    import copy as _copy
+
+    # copy view/gridlines
+    try:
+        ws_dest.sheet_view.showGridLines = ws_src.sheet_view.showGridLines
+    except Exception:
+        pass
+
+    # copy merged cells (copy the ranges first)
+    try:
+        for merged in ws_src.merged_cells.ranges:
+            ws_dest.merge_cells(str(merged))
+    except Exception:
+        pass
+
+    # copy column widths
+    try:
+        for col_letter, col_dim in ws_src.column_dimensions.items():
+            try:
+                ws_dest.column_dimensions[col_letter].width = col_dim.width
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # copy row heights
+    try:
+        for idx, row_dim in ws_src.row_dimensions.items():
+            try:
+                ws_dest.row_dimensions[idx].height = row_dim.height
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # copy cell values and styles but skip MergedCell instances (they are part of merged ranges)
+    for row in ws_src.iter_rows():
+        for cell in row:
+            # skip merged cell placeholders (only top-left real cells hold style/value we need)
+            if isinstance(cell, MergedCell):
+                continue
+            new = ws_dest.cell(row=cell.row, column=cell.col_idx, value=cell.value)
+            try:
+                if getattr(cell, "has_style", False):
+                    # copy style attributes defensively
+                    new.font = _copy.copy(cell.font)
+                    new.border = _copy.copy(cell.border)
+                    new.fill = _copy.copy(cell.fill)
+                    new.number_format = cell.number_format
+                    new.protection = _copy.copy(cell.protection)
+                    new.alignment = _copy.copy(cell.alignment)
+            except Exception:
+                new.value = cell.value
+
+    # copy simple page setup attributes to ensure landscape, fitToPage, etc.
+    try:
+        ws_dest.page_setup.orientation = ws_src.page_setup.orientation
+        ws_dest.page_setup.paperSize = ws_src.page_setup.paperSize
+        ws_dest.page_setup.fitToPage = ws_src.page_setup.fitToPage
+        ws_dest.page_setup.fitToHeight = ws_src.page_setup.fitToHeight
+        ws_dest.page_setup.fitToWidth = ws_src.page_setup.fitToWidth
+    except Exception:
+        pass
+
+    # images: re-add logo if available (we don't reliably copy embedded images between workbooks)
+    add_logo_if_exists(ws_dest, 'A1')
+
+    # After copying, try to detect the table header ("JOUR") row and draw borders to ensure closed borders,
+    # but limit the end_row to the last occurrence of a day name (so signature rows are not affected).
+    header_row = None
+    try:
+        for r in range(1, min(30, ws_dest.max_row) + 1):
+            val = ws_dest.cell(row=r, column=1).value
+            if isinstance(val, str) and val.strip().upper() == 'JOUR':
+                header_row = r
+                break
+    except Exception:
+        header_row = None
+
+    if header_row:
+        try:
+            # find last row of the table by searching for the last appearance of a day name in column A
+            last_row_table = None
+            for r in range(header_row, ws_dest.max_row + 1):
+                v = ws_dest.cell(row=r, column=1).value
+                if isinstance(v, str) and v.strip() in JOURS:
+                    last_row_table = r
+            if last_row_table:
+                # the table ends at the last day row (which is last_row_table + (number of rows per day -1))
+                # But since we have one row per day, find last contiguous day block from header_row+1
+                # to last_row_table + (maybe merged holiday rows). We set end_row to the last row where column A contains a day or the last non-empty row within expected table range.
+                # Simpler: set end_row to the last row between header_row and ws_dest.max_row where column 1 is a day name OR where any of columns B..E contains content related to the table.
+                # We'll compute a conservative end_row by looking upward from ws_dest.max_row to header_row and stop at first row that contains a day name or table cell content.
+                end_row = None
+                for r in range(ws_dest.max_row, header_row - 1, -1):
+                    a_val = ws_dest.cell(row=r, column=1).value
+                    if (isinstance(a_val, str) and a_val.strip() in JOURS) or any([ws_dest.cell(row=r, column=c).value not in (None, '') for c in range(2,6)]):
+                        end_row = r
+                        break
+                if end_row and end_row >= header_row:
+                    _draw_table_borders(ws_dest, header_row, end_row, 1, 5, meta_top_row=5)
+            else:
+                # fallback: use rows 9..max_row but this is rare
+                last_row = ws_dest.max_row
+                _draw_table_borders(ws_dest, header_row, last_row, 1, 5, meta_top_row=5)
+        except Exception:
+            pass
+
+# Remaining code: template and export functions (landscape mode enforced, bold text, borders closed)
+def create_excel_formateur_semaine(formateur, data, semaine_label, mois_label, week_ranges, niveau="1ère Année"):
     wb = openpyxl.Workbook()
     ws = wb.active
-    raw_title = f"{formateur[:20]}-{str(semaine_label)[:12]}"
+    # sheet title: formateur + month (no week)
+    raw_title = f"{formateur[:20]}-{mois_label[:10]}"
     ws.title = sanitize_sheet_title(raw_title)
     ws.sheet_view.showGridLines = False
 
-    # page setup
+    # page setup (explicit landscape)
     ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
     ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.page_setup.fitToPage = True
     ws.page_setup.fitToHeight = 1
     ws.page_setup.fitToWidth = 1
 
-    border_thin = Border(left=Side(style='thin', color='000000'),
-                         right=Side(style='thin', color='000000'),
-                         top=Side(style='thin', color='000000'),
-                         bottom=Side(style='thin', color='000000'))
-    title_font = Font(bold=True, size=12, name='Calibri')
-    meta_font = Font(bold=True, size=10, name='Calibri')
-    header_font = Font(bold=True, size=11, name='Calibri')
-    normal_font = Font(size=10, name='Calibri')
-    center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
-    left_align = Alignment(horizontal='left', vertical='center')
-
     add_logo_if_exists(ws, 'A1')
 
-    ws.merge_cells('B1:E2')
-    ws['B1'] = 'EMPLOI DU TEMPS DE FORMATEUR : FORMATION HYBRIDE - V 1.0'
-    ws['B1'].font = title_font
-    ws['B1'].alignment = center_align
-
-    heures = compute_hours_for_formateur(data, semaine_label, mois_label, week_ranges)
-    ws.merge_cells('B3:E3')
-    ws['B3'] = f'MASSE HORAIRE: {heures:.1f}H/SEMAINE'
-    ws['B3'].font = meta_font
-    ws['B3'].alignment = center_align
-
+    # compute periode text
     try:
         start_dt = get_week_start_from_label(mois_label, semaine_label, week_ranges)
         end_dt = start_dt + timedelta(days=5) if start_dt else None
-        periode_text = f"Du {start_dt.strftime('%d/%m/%Y')} au {end_dt.strftime('%d/%m/%Y')}" if start_dt and end_dt else ""
+        periode_text = f"Date d'application: Du {start_dt.strftime('%d/%m/%Y')} au {end_dt.strftime('%d/%m/%Y')}" if start_dt and end_dt else ""
     except Exception:
         periode_text = ""
-    ws.merge_cells('B4:E4')
-    ws['B4'] = f"Date d'application: {periode_text}" if periode_text else ""
-    ws['B4'].font = meta_font
-    ws['B4'].alignment = center_align
 
-    ws['A5'] = 'CFP TLRA/IFMLT'; ws['A5'].font = meta_font; ws['A5'].alignment = left_align
-    ws['A6'] = f'Formateur: {formateur}'; ws['A6'].font = meta_font; ws['A6'].alignment = left_align
-    ws['A7'] = f'Semaine: {semaine_label} ({mois_label})'; ws['A7'].font = meta_font; ws['A7'].alignment = left_align
-    ws['A8'] = 'Année de Formation: 2025/2026'; ws['A8'].font = meta_font; ws['A8'].alignment = left_align
+    title_text = 'EMPLOI DU TEMPS DE FORMATEUR : FORMATION HYBRIDE - V 1.0'
+    heures_val = compute_hours_for_formateur(data, semaine_label, mois_label, week_ranges)
+    heures_text = f'MASSE HORAIRE: {heures_val:.1f}H/SEMAINE'
+    left_meta = [('A5', 'CFP TLRA/IFMLT'),
+                 ('A6', f'Formateur: {formateur}'),
+                 ('A7', f'Mois: {mois_label}'),
+                 ('A8', 'Année de Formation: 2025/2026')]
+    right_meta = ['', '', f'Niveau: {niveau}', '']
+    _apply_template_title(ws, title_text, heures_text, periode_text, left_meta, right_meta)
 
+    # Header row (JOUR + 4 créneaux)
     header_row = 9
-    headers = ['JOUR',
-               f'AM1\n{HORAIRES["AM1"]}',
-               f'AM2\n{HORAIRES["AM2"]}',
-               f'PM1\n{HORAIRES["PM1"]}',
-               f'PM2\n{HORAIRES["PM2"]}']
+    header_font = Font(bold=True, size=10)
+    center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    border_thin = Border(left=Side(style='thin'), right=Side(style='thin'),
+                         top=Side(style='thin'), bottom=Side(style='thin'))
+    headers = ['JOUR'] + [f"{c}\n{HORAIRES[c]}" for c in CRENEAUX_JOUR]
+    for idx, txt in enumerate(headers, start=1):
+        cell = ws.cell(row=header_row, column=idx, value=txt)
+        cell.font = header_font
+        cell.alignment = center_align
+        cell.border = border_thin
+    ws.row_dimensions[header_row].height = 26
+
+    # Fill rows with slots and holiday handling
+    row = header_row + 1
+    week_start = get_week_start_from_label(mois_label, semaine_label, week_ranges)
+    for j_idx, jour in enumerate(JOURS):
+        ws.cell(row=row, column=1, value=jour).font = Font(bold=True)
+        ws.cell(row=row, column=1).alignment = Alignment(horizontal='center', vertical='center')
+        ws.cell(row=row, column=1).border = border_thin
+        d = day_date(week_start, j_idx)
+        holiday_label = is_holiday(d) if d else None
+        if holiday_label:
+            # merge AM/PM cells and fill
+            ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=5)
+            cell = ws.cell(row=row, column=2, value=holiday_label)
+            cell.font = HOLIDAY_FONT
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+            cell.fill = HOLIDAY_FILL
+            # Ensure border on all merged cells including rightmost cell
+            for c in range(2,6):
+                ws.cell(row=row, column=c).border = border_thin
+        else:
+            for ci, creneau in enumerate(CRENEAUX_JOUR, start=2):
+                key = f"{semaine_label}-{jour}-{creneau}"
+                slot = data['slots'].get(key, ('',''))
+                grp, salle = slot
+                text = f"{grp}\n{salle}" if grp and salle else ""
+                cell = ws.cell(row=row, column=ci, value=text)
+                # set content bold as requested
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                cell.font = Font(size=10, bold=True)
+                cell.border = border_thin
+        ws.row_dimensions[row].height = 28
+        row += 1
+
+    # draw outer table borders for the table only (header_row..row-1)
+    _draw_table_borders(ws, header_row, row-1, 1, 5, meta_top_row=5)
+
+    # signatures / formatting (placed after the table)
+    sig_row = row + 1
+    # Write director text (no borders will remain after clearing)
+    ws.cell(row=sig_row, column=1, value='Directeur EFP').font = Font(size=10, bold=True)
+    ws.cell(row=sig_row, column=1).alignment = Alignment(horizontal='left', vertical='center')
+    # ensure signature rows have NO borders (remove grid for both the empty line above and the signature line)
+    try:
+        clear_row_borders(ws, sig_row - 1, 1, 5)
+    except Exception:
+        pass
+    try:
+        clear_row_borders(ws, sig_row, 1, 5)
+    except Exception:
+        pass
+
+    ws.column_dimensions['A'].width = 18
+    for col in ['B','C','D','E']:
+        ws.column_dimensions[col].width = 20
+
+    return wb
+
+def create_excel_groupe_semaine(groupe, schedule_data, semaine_label, mois_label, week_ranges, niveau="1ère Année"):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    raw_title = f"{groupe[:20]}-{mois_label[:10]}"
+    ws.title = sanitize_sheet_title(raw_title)
+    ws.sheet_view.showGridLines = False
+
+    # page setup (explicit landscape)
+    ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.fitToPage = True
+    ws.page_setup.fitToHeight = 1
+    ws.page_setup.fitToWidth = 1
+
+    add_logo_if_exists(ws, 'A1')
+
+    # compute periode text
+    try:
+        start_dt = get_week_start_from_label(mois_label, semaine_label, week_ranges)
+        end_dt = start_dt + timedelta(days=5) if start_dt else None
+        periode_text = f"Date d'application: Du {start_dt.strftime('%d/%m/%Y')} au {end_dt.strftime('%d/%m/%Y')}" if start_dt and end_dt else ""
+    except Exception:
+        periode_text = ""
+
+    title_text = 'EMPLOI DU TEMPS PAR GROUPE : FORMATION HYBRIDE - V 1.0'
+    heures_val = compute_hours_for_groupe(schedule_data, groupe, semaine_label, mois_label, week_ranges)
+    heures_text = f'MASSE HORAIRE: {heures_val:.1f}H/SEMAINE'
+    left_meta = [('A5', 'CFP TLRA/IFMLT'),
+                 ('A6', f'Groupe: {groupe}'),
+                 ('A7', f'Mois: {mois_label}'),
+                 ('A8', 'Année de Formation: 2025/2026')]
+    right_meta = ['', '', f'Niveau: {niveau}', '']
+    _apply_template_title(ws, title_text, heures_text, periode_text, left_meta, right_meta)
+
+    # Header row
+    header_row = 9
+    header_font = Font(bold=True, size=10)
+    center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    border_thin = Border(left=Side(style='thin'), right=Side(style='thin'),
+                         top=Side(style='thin'), bottom=Side(style='thin'))
+    headers = ['JOUR'] + [f"{c}\n{HORAIRES[c]}" for c in CRENEAUX_JOUR]
     for idx, txt in enumerate(headers, start=1):
         cell = ws.cell(row=header_row, column=idx, value=txt)
         cell.font = header_font
@@ -511,94 +828,54 @@ def create_excel_formateur_semaine(formateur, data, semaine_label, mois_label, w
     row = header_row + 1
     week_start = get_week_start_from_label(mois_label, semaine_label, week_ranges)
     for j_idx, jour in enumerate(JOURS):
-        ws.cell(row=row, column=1, value=jour).font = meta_font
-        ws.cell(row=row, column=1).alignment = center_align
-        ws.cell(row=row, column=1).border = border_thin
+        ws.cell(row=row, column=1, value=jour).font = Font(bold=True)
+        ws.cell(row=row, column=1).alignment = Alignment(horizontal='center', vertical='center')
         d = day_date(week_start, j_idx)
         holiday_label = is_holiday(d) if d else None
         if holiday_label:
             ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=5)
-            ws.cell(row=row, column=2, value=holiday_label).font = meta_font
-            ws.cell(row=row, column=2).alignment = center_align
+            cell = ws.cell(row=row, column=2, value=holiday_label)
+            cell.font = HOLIDAY_FONT
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+            cell.fill = HOLIDAY_FILL
             for c in range(2,6):
-                cell = ws.cell(row=row, column=c)
-                cell.fill = HOLIDAY_FILL
-                cell.font = HOLIDAY_FONT
-                cell.alignment = center_align
-                cell.border = border_thin
+                ws.cell(row=row, column=c).border = border_thin
         else:
             for ci, creneau in enumerate(CRENEAUX_JOUR, start=2):
                 key = f"{semaine_label}-{jour}-{creneau}"
-                slot = data['slots'].get(key, ('',''))
-                grp, salle = slot
-                text = f"{grp}\n{salle}" if grp and salle else ""
-                cell = ws.cell(row=row, column=ci, value=text)
-                cell.font = Font(size=10, name='Calibri')
-                cell.alignment = center_align
+                info = ""
+                for f, fd in schedule_data.items():
+                    s = fd['slots'].get(key)
+                    if s and s[0] == groupe:
+                        info = f"{f}\n{s[1].replace(' (CONFLIT NON RESOLU)',' (Conflit)')}"
+                        break
+                cell = ws.cell(row=row, column=ci, value=info)
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                cell.font = Font(size=10, bold=True)
                 cell.border = border_thin
         ws.row_dimensions[row].height = 28
         row += 1
 
-    for r in range(header_row, row):
-        ws.cell(row=r, column=5).border = border_thin
+    _draw_table_borders(ws, header_row, row-1, 1, 5, meta_top_row=5)
 
+    # signatures / formatting
     sig_row = row + 1
-    ws.cell(row=sig_row, column=1, value='Directeur EFP').font = Font(size=10)
+    ws.cell(row=sig_row, column=1, value='Directeur EFP').font = Font(size=10, bold=True)
+    ws.cell(row=sig_row, column=1).alignment = Alignment(horizontal='left', vertical='center')
+    # remove borders on signature rows
+    try:
+        clear_row_borders(ws, sig_row - 1, 1, 5)
+    except Exception:
+        pass
+    try:
+        clear_row_borders(ws, sig_row, 1, 5)
+    except Exception:
+        pass
+
     ws.column_dimensions['A'].width = 18
-    ws.column_dimensions['B'].width = 20
-    ws.column_dimensions['C'].width = 20
-    ws.column_dimensions['D'].width = 20
-    ws.column_dimensions['E'].width = 20
+    for col in ['B','C','D','E']:
+        ws.column_dimensions[col].width = 20
 
-    return wb
-
-def create_excel_groupe_semaine(groupe, schedule_data, semaine_label, mois_label, week_ranges):
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    raw_title = f"{groupe[:20]}-{str(semaine_label)[:12]}"
-    ws.title = sanitize_sheet_title(raw_title)
-    ws.sheet_view.showGridLines = False
-    add_logo_if_exists(ws, 'A1')
-
-    ws.merge_cells('B1:E2'); ws['B1'] = 'EMPLOI DU TEMPS PAR GROUPE : FORMATION HYBRIDE - V 1.0'; ws['B1'].font = Font(bold=True)
-    heures = compute_hours_for_groupe(schedule_data, groupe, semaine_label, mois_label, week_ranges)
-    ws.merge_cells('B3:E3'); ws['B3'] = f'MASSE HORAIRE: {heures:.1f}H/SEMAINE'; ws['B3'].font = Font(bold=True)
-
-    header_row = 9
-    headers = ['JOUR'] + [f"{c}\n{HORAIRES[c]}" for c in CRENEAUX_JOUR]
-    for idx, txt in enumerate(headers, start=1):
-        cell = ws.cell(row=header_row, column=idx, value=txt)
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal='center', vertical='center')
-        cell.border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                             top=Side(style='thin'), bottom=Side(style='thin'))
-    row = header_row + 1
-    week_start = get_week_start_from_label(mois_label, semaine_label, week_ranges)
-    for j_idx, jour in enumerate(JOURS):
-        ws.cell(row=row, column=1, value=jour)
-        d = day_date(week_start, j_idx)
-        for ci, creneau in enumerate(CRENEAUX_JOUR, start=2):
-            key = f"{semaine_label}-{jour}-{creneau}"
-            info = ""
-            for f, fd in schedule_data.items():
-                s = fd['slots'].get(key)
-                if s and s[0] == groupe:
-                    info = f"{f}\n{s[1].replace(' (CONFLIT NON RESOLU)',' (Conflit)')}"
-                    break
-            if d:
-                hol = is_holiday(d)
-                if hol:
-                    info = hol
-            ws.cell(row=row, column=ci, value=info)
-        row += 1
-    for r in range(header_row, row):
-        ws.cell(row=r, column=5).border = Border(left=Side(style='thin'), right=Side(style='thin'),
-                                                 top=Side(style='thin'), bottom=Side(style='thin'))
-    ws.column_dimensions['A'].width = 18
-    ws.column_dimensions['B'].width = 20
-    ws.column_dimensions['C'].width = 20
-    ws.column_dimensions['D'].width = 20
-    ws.column_dimensions['E'].width = 20
     return wb
 
 # --- get_available_salles (simple) ---
@@ -628,6 +905,11 @@ with st.sidebar:
         st.session_state['resolved_data'] = None
     if 'conflits_log' not in st.session_state:
         st.session_state['conflits_log'] = pd.DataFrame()
+    # Niveau global éditable (optional) - default "1ère Année"
+    if 'niveau_global' not in st.session_state:
+        st.session_state['niveau_global'] = "1ère Année"
+    st.text_input("Niveau (valeur export)", key="niveau_global", help="Valeur affichée dans 'Niveau' sur les exports (ex: 1ère Année)")
+
     if uploaded_file:
         if st.session_state['raw_data'] is None or uploaded_file != st.session_state.get('uploaded_file_ref'):
             with st.spinner("Analyse et résolution des conflits..."):
@@ -727,9 +1009,8 @@ else:
                 st.metric("Heures (hors fériés)", f"{heures:.2f}h")
             st.markdown("### 📄 Export Excel")
             if st.button("📥 Générer Excel (Formateur)", key="btn_export_form"):
-                wb = create_excel_formateur_semaine(selected_form, fdata, selected_semaine, selected_month, week_ranges)
-                # sanitize filename as well
-                filename = sanitize_sheet_title(f"EDT_Formateur_{selected_form}_{selected_month}_{selected_semaine}", max_len=80) + ".xlsx"
+                wb = create_excel_formateur_semaine(selected_form, fdata, selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
+                filename = sanitize_sheet_title(f"EDT_Formateur_{selected_form}_{selected_month}", max_len=80) + ".xlsx"
                 st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
 
         st.markdown("---")
@@ -739,11 +1020,10 @@ else:
                 wb_final.remove(wb_final.active)
                 used_names = set()
                 for form in parsed['formateurs']:
-                    wb_temp = create_excel_formateur_semaine(form, parsed['schedule'][form], selected_semaine, selected_month, week_ranges)
+                    wb_temp = create_excel_formateur_semaine(form, parsed['schedule'][form], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
                     ws_temp = wb_temp.active
-                    sheet_base = sanitize_sheet_title(f"{form[:25]}_{selected_semaine}", max_len=31)
+                    sheet_base = sanitize_sheet_title(f"{form[:25]}_{selected_month}", max_len=31)
                     sheet_name = sheet_base
-                    # ensure uniqueness
                     i = 1
                     while sheet_name in used_names:
                         suffix = f"_{i}"
@@ -751,14 +1031,10 @@ else:
                         i += 1
                     used_names.add(sheet_name)
                     ws_new = wb_final.create_sheet(title=sheet_name)
-                    ws_new.sheet_view.showGridLines = False
-                    for row_idx in range(1, ws_temp.max_row + 1):
-                        for col_idx in range(1, ws_temp.max_column + 1):
-                            cell = ws_temp.cell(row=row_idx, column=col_idx)
-                            ws_new.cell(row=row_idx, column=col_idx, value=cell.value)
-                    add_logo_if_exists(ws_new, 'A1')
+                    # copy entire sheet (styles, merges, sizes) and ensure borders closed only for table area
+                    copy_sheet(ws_temp, ws_new)
 
-                filename = sanitize_sheet_title(f"Pack_Formateurs_{selected_month}_{selected_semaine}", max_len=80) + ".xlsx"
+                filename = sanitize_sheet_title(f"Pack_Formateurs_{selected_month}", max_len=80) + ".xlsx"
                 st.download_button("💾 Télécharger Pack Excel (Formateurs)", excel_to_bytes(wb_final), filename)
 
     # Tab2: Groupes
@@ -771,8 +1047,8 @@ else:
             heures_g = compute_hours_for_groupe(parsed['schedule'], selected_grp, selected_semaine, selected_month, week_ranges)
             st.metric("Heures (hors fériés)", f"{heures_g:.2f}h")
             if st.button("📥 Générer Excel (Groupe)"):
-                wb = create_excel_groupe_semaine(selected_grp, parsed['schedule'], selected_semaine, selected_month, week_ranges)
-                filename = sanitize_sheet_title(f"EDT_Groupe_{selected_grp}_{selected_month}_{selected_semaine}", max_len=80) + ".xlsx"
+                wb = create_excel_groupe_semaine(selected_grp, parsed['schedule'], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
+                filename = sanitize_sheet_title(f"EDT_Groupe_{selected_grp}_{selected_month}", max_len=80) + ".xlsx"
                 st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
 
         st.markdown("---")
@@ -782,9 +1058,9 @@ else:
                 wb_final.remove(wb_final.active)
                 used_names = set()
                 for groupe in parsed['groupes']:
-                    wb_temp = create_excel_groupe_semaine(groupe, parsed['schedule'], selected_semaine, selected_month, week_ranges)
+                    wb_temp = create_excel_groupe_semaine(groupe, parsed['schedule'], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
                     ws_temp = wb_temp.active
-                    sheet_base = sanitize_sheet_title(f"{groupe[:25]}_{selected_semaine}", max_len=31)
+                    sheet_base = sanitize_sheet_title(f"{groupe[:25]}_{selected_month}", max_len=31)
                     sheet_name = sheet_base
                     i = 1
                     while sheet_name in used_names:
@@ -793,12 +1069,8 @@ else:
                         i += 1
                     used_names.add(sheet_name)
                     ws_new = wb_final.create_sheet(title=sheet_name)
-                    for row_idx in range(1, ws_temp.max_row + 1):
-                        for col_idx in range(1, ws_temp.max_column + 1):
-                            cell = ws_temp.cell(row=row_idx, column=col_idx)
-                            ws_new.cell(row=row_idx, column=col_idx, value=cell.value)
-                    add_logo_if_exists(ws_new, 'A1')
-                filename = sanitize_sheet_title(f"Pack_Groupes_{selected_month}_{selected_semaine}", max_len=80) + ".xlsx"
+                    copy_sheet(ws_temp, ws_new)
+                filename = sanitize_sheet_title(f"Pack_Groupes_{selected_month}", max_len=80) + ".xlsx"
                 st.download_button("💾 Télécharger Pack Excel (Groupes)", excel_to_bytes(wb_final), filename)
 
     # Tab3: Salles & Conflits
