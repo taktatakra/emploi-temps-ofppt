@@ -450,6 +450,36 @@ def clear_row_borders(ws, row_idx, start_col=1, end_col=5):
         except Exception:
             pass
 
+# Utility to clear meta area borders (aggressive removal)
+def clear_meta_borders(ws, meta_top_row=5, start_col=1, end_col=5):
+    """
+    Remove all borders on cells in rows 1..meta_top_row and columns start_col..end_col.
+    This removes any residual top/right/left borders in the metadata area.
+    """
+    empty_border = Border()
+    for r in range(1, meta_top_row + 1):
+        for c in range(start_col, end_col + 1):
+            try:
+                ws.cell(row=r, column=c).border = empty_border
+            except Exception:
+                pass
+
+# Utility to find signature rows and clear their borders
+def find_and_clear_signature_rows(ws, signature_text='Directeur EFP', start_col=1, end_col=5):
+    try:
+        sig_rows = []
+        for r in range(1, ws.max_row + 1):
+            v = ws.cell(row=r, column=1).value
+            if isinstance(v, str) and signature_text.lower() in v.strip().lower():
+                sig_rows.append(r)
+        for r in sig_rows:
+            # clear the signature row and the row above it
+            clear_row_borders(ws, r, start_col, end_col)
+            if r - 1 >= 1:
+                clear_row_borders(ws, r - 1, start_col, end_col)
+    except Exception:
+        pass
+
 # Centralized style helpers for the template
 def _apply_template_title(ws, title_text, heures_text, periode_text, left_meta, right_meta):
     # title B1:E2
@@ -490,8 +520,8 @@ def _draw_table_borders(ws, start_row, end_row, start_col=1, end_col=5, meta_top
     Draw borders for the rectangular table.
     NOTE: The function assumes end_row is the last row of the TABLE (not including signature rows).
     It will draw borders for the table area from start_row..end_row and columns start_col..end_col.
-    The left vertical border is extended up to meta_top_row, but the right vertical border is NOT
-    extended into the metadata area to avoid showing a vertical grid near "Niveau: ...".
+    The left vertical border is extended up to meta_top_row (to keep left frame).
+    The right vertical border is drawn only from start_row downward (to avoid border in meta area).
     """
     thin_side = Side(style='thin', color='000000')
     border_all = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
@@ -560,6 +590,7 @@ def copy_sheet(ws_src, ws_dest):
      - re-add logo if available
      - copy page_setup attributes (orientation, etc.)
      - ensure borders are closed only for the real table area (not signature rows)
+     - afterwards clear metadata borders and signature rows borders
     """
     from openpyxl.cell.cell import MergedCell
     import copy as _copy
@@ -643,35 +674,34 @@ def copy_sheet(ws_src, ws_dest):
 
     if header_row:
         try:
-            # find last row of the table by searching for the last appearance of a day name in column A
-            last_row_table = None
-            for r in range(header_row, ws_dest.max_row + 1):
-                v = ws_dest.cell(row=r, column=1).value
-                if isinstance(v, str) and v.strip() in JOURS:
-                    last_row_table = r
-            if last_row_table:
-                # the table ends at the last day row (which is last_row_table + (number of rows per day -1))
-                # But since we have one row per day, find last contiguous day block from header_row+1
-                # to last_row_table + (maybe merged holiday rows). We set end_row to the last row where column A contains a day or the last non-empty row within expected table range.
-                # Simpler: set end_row to the last row between header_row and ws_dest.max_row where column 1 is a day name OR where any of columns B..E contains content related to the table.
-                # We'll compute a conservative end_row by looking upward from ws_dest.max_row to header_row and stop at first row that contains a day name or table cell content.
-                end_row = None
-                for r in range(ws_dest.max_row, header_row - 1, -1):
-                    a_val = ws_dest.cell(row=r, column=1).value
-                    if (isinstance(a_val, str) and a_val.strip() in JOURS) or any([ws_dest.cell(row=r, column=c).value not in (None, '') for c in range(2,6)]):
-                        end_row = r
-                        break
-                if end_row and end_row >= header_row:
-                    _draw_table_borders(ws_dest, header_row, end_row, 1, 5, meta_top_row=5)
+            # find end_row (last meaningful table row)
+            end_row = None
+            for r in range(ws_dest.max_row, header_row - 1, -1):
+                a_val = ws_dest.cell(row=r, column=1).value
+                if (isinstance(a_val, str) and a_val.strip() in JOURS) or any([ws_dest.cell(row=r, column=c).value not in (None, '') for c in range(2,6)]):
+                    end_row = r
+                    break
+            if end_row and end_row >= header_row:
+                _draw_table_borders(ws_dest, header_row, end_row, 1, 5, meta_top_row=5)
             else:
-                # fallback: use rows 9..max_row but this is rare
                 last_row = ws_dest.max_row
                 _draw_table_borders(ws_dest, header_row, last_row, 1, 5, meta_top_row=5)
         except Exception:
             pass
 
+    # After drawing, aggressively clear metadata borders and signature rows
+    try:
+        clear_meta_borders(ws_dest, meta_top_row=5, start_col=1, end_col=5)
+    except Exception:
+        pass
+    try:
+        find_and_clear_signature_rows(ws_dest, signature_text='Directeur EFP', start_col=1, end_col=5)
+    except Exception:
+        pass
+
 # Remaining code: template and export functions (landscape mode enforced, bold text, borders closed)
-def create_excel_formateur_semaine(formateur, data, semaine_label, mois_label, week_ranges, niveau="1ère Année"):
+# NOTE: create_excel_formateur_semaine now accepts an optional flag force_25_to_26 to enable/disable the 26H rule.
+def create_excel_formateur_semaine(formateur, data, semaine_label, mois_label, week_ranges, niveau="1ère Année", force_25_to_26=True):
     wb = openpyxl.Workbook()
     ws = wb.active
     # sheet title: formateur + month (no week)
@@ -697,7 +727,15 @@ def create_excel_formateur_semaine(formateur, data, semaine_label, mois_label, w
         periode_text = ""
 
     title_text = 'EMPLOI DU TEMPS DE FORMATEUR : FORMATION HYBRIDE - V 1.0'
-    heures_val = compute_hours_for_formateur(data, semaine_label, mois_label, week_ranges)
+
+    # --- SPECIAL RULE: if computed masse horaire equals 25.0 -> force 26.0 (only if enabled)
+    # Compute normal hours
+    heures_val_calc = compute_hours_for_formateur(data, semaine_label, mois_label, week_ranges)
+    if force_25_to_26 and abs(heures_val_calc - 25.0) < 0.01:
+        heures_val = 26.0
+    else:
+        heures_val = heures_val_calc
+
     heures_text = f'MASSE HORAIRE: {heures_val:.1f}H/SEMAINE'
     left_meta = [('A5', 'CFP TLRA/IFMLT'),
                  ('A6', f'Formateur: {formateur}'),
@@ -705,6 +743,9 @@ def create_excel_formateur_semaine(formateur, data, semaine_label, mois_label, w
                  ('A8', 'Année de Formation: 2025/2026')]
     right_meta = ['', '', f'Niveau: {niveau}', '']
     _apply_template_title(ws, title_text, heures_text, periode_text, left_meta, right_meta)
+
+    # Ensure metadata borders removed right away (precaution)
+    clear_meta_borders(ws, meta_top_row=5, start_col=1, end_col=5)
 
     # Header row (JOUR + 4 créneaux)
     header_row = 9
@@ -755,6 +796,9 @@ def create_excel_formateur_semaine(formateur, data, semaine_label, mois_label, w
 
     # draw outer table borders for the table only (header_row..row-1)
     _draw_table_borders(ws, header_row, row-1, 1, 5, meta_top_row=5)
+
+    # Remove any residual metadata borders
+    clear_meta_borders(ws, meta_top_row=5, start_col=1, end_col=5)
 
     # signatures / formatting (placed after the table)
     sig_row = row + 1
@@ -811,6 +855,9 @@ def create_excel_groupe_semaine(groupe, schedule_data, semaine_label, mois_label
     right_meta = ['', '', f'Niveau: {niveau}', '']
     _apply_template_title(ws, title_text, heures_text, periode_text, left_meta, right_meta)
 
+    # ensure metadata cleared
+    clear_meta_borders(ws, meta_top_row=5, start_col=1, end_col=5)
+
     # Header row
     header_row = 9
     header_font = Font(bold=True, size=10)
@@ -857,6 +904,7 @@ def create_excel_groupe_semaine(groupe, schedule_data, semaine_label, mois_label
         row += 1
 
     _draw_table_borders(ws, header_row, row-1, 1, 5, meta_top_row=5)
+    clear_meta_borders(ws, meta_top_row=5, start_col=1, end_col=5)
 
     # signatures / formatting
     sig_row = row + 1
@@ -909,6 +957,11 @@ with st.sidebar:
     if 'niveau_global' not in st.session_state:
         st.session_state['niveau_global'] = "1ère Année"
     st.text_input("Niveau (valeur export)", key="niveau_global", help="Valeur affichée dans 'Niveau' sur les exports (ex: 1ère Année)")
+
+    # NEW: Switch to activate/deactivate the 26H rule (25->26)
+    if 'force_25_to_26' not in st.session_state:
+        st.session_state['force_25_to_26'] = True
+    st.checkbox("Activer règle 25h -> 26h (masse horaire statutaire)", value=st.session_state['force_25_to_26'], key="force_25_to_26", help="Si coché, toute masse horaire calculée à 25.0 sera remplacée par 26.0 sur les exports formateur.")
 
     if uploaded_file:
         if st.session_state['raw_data'] is None or uploaded_file != st.session_state.get('uploaded_file_ref'):
@@ -1001,15 +1054,20 @@ else:
             fdata = parsed['schedule'][selected_form]
             df_view = build_schedule_table_for_formateur(fdata, selected_semaine, selected_month, week_ranges)
             st.dataframe(df_view, use_container_width=True)
-            heures = compute_hours_for_formateur(fdata, selected_semaine, selected_month, week_ranges)
+            # compute hours with same special rule shown in exports (if computed == 25 -> 26) but only if switch enabled
+            heures_calc = compute_hours_for_formateur(fdata, selected_semaine, selected_month, week_ranges)
+            if st.session_state.get('force_25_to_26', True) and abs(heures_calc - 25.0) < 0.01:
+                heures_display = 26.0
+            else:
+                heures_display = heures_calc
             coll, colr = st.columns([3,1])
             with coll:
                 st.info(f"🏢 Salle préférée: {fdata['salle']}")
             with colr:
-                st.metric("Heures (hors fériés)", f"{heures:.2f}h")
+                st.metric("Heures (hors fériés)", f"{heures_display:.2f}h")
             st.markdown("### 📄 Export Excel")
             if st.button("📥 Générer Excel (Formateur)", key="btn_export_form"):
-                wb = create_excel_formateur_semaine(selected_form, fdata, selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
+                wb = create_excel_formateur_semaine(selected_form, fdata, selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'), force_25_to_26=st.session_state.get('force_25_to_26', True))
                 filename = sanitize_sheet_title(f"EDT_Formateur_{selected_form}_{selected_month}", max_len=80) + ".xlsx"
                 st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
 
@@ -1020,7 +1078,7 @@ else:
                 wb_final.remove(wb_final.active)
                 used_names = set()
                 for form in parsed['formateurs']:
-                    wb_temp = create_excel_formateur_semaine(form, parsed['schedule'][form], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
+                    wb_temp = create_excel_formateur_semaine(form, parsed['schedule'][form], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'), force_25_to_26=st.session_state.get('force_25_to_26', True))
                     ws_temp = wb_temp.active
                     sheet_base = sanitize_sheet_title(f"{form[:25]}_{selected_month}", max_len=31)
                     sheet_name = sheet_base
@@ -1031,7 +1089,7 @@ else:
                         i += 1
                     used_names.add(sheet_name)
                     ws_new = wb_final.create_sheet(title=sheet_name)
-                    # copy entire sheet (styles, merges, sizes) and ensure borders closed only for table area
+                    # copy entire sheet (styles, merges, sizes) and ensure borders closed only for table area then clear meta
                     copy_sheet(ws_temp, ws_new)
 
                 filename = sanitize_sheet_title(f"Pack_Formateurs_{selected_month}", max_len=80) + ".xlsx"
