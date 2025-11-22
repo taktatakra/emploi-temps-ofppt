@@ -1256,6 +1256,18 @@ def get_available_salles(resolved_schedule, all_salles, semaine_label, jour, cre
                 occ.add(s)
     return sorted(list(set(all_salles) - occ))
 
+# --- INITIALIZE SESSION STATE ---
+if 'raw_data' not in st.session_state:
+    st.session_state['raw_data'] = None
+if 'resolved_data' not in st.session_state:
+    st.session_state['resolved_data'] = None
+if 'conflits_log' not in st.session_state:
+    st.session_state['conflits_log'] = pd.DataFrame()
+if 'niveau_global' not in st.session_state:
+    st.session_state['niveau_global'] = "1ère Année"
+if 'force_25_to_26' not in st.session_state:
+    st.session_state['force_25_to_26'] = True
+
 # --- SIDEBAR: Upload & processing ---
 with st.sidebar:
     # Utiliser le logo local s'il existe, sinon l'URL
@@ -1267,20 +1279,11 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 📤 Import du Fichier")
     uploaded_file = st.file_uploader("Fichier Excel multi-onglets", type=['xlsx','xls'], accept_multiple_files=False, help="Sélectionnez le fichier contenant les onglets 'Planning_Mois'")
-    if 'raw_data' not in st.session_state:
-        st.session_state['raw_data'] = None
-    if 'resolved_data' not in st.session_state:
-        st.session_state['resolved_data'] = None
-    if 'conflits_log' not in st.session_state:
-        st.session_state['conflits_log'] = pd.DataFrame()
-    # Niveau global éditable (optional) - default "1ère Année"
-    if 'niveau_global' not in st.session_state:
-        st.session_state['niveau_global'] = "1ère Année"
+    
+    # Niveau global éditable
     st.text_input("Niveau (valeur export)", key="niveau_global", help="Valeur affichée dans 'Niveau' sur les exports (ex: 1ère Année)")
 
-    # NEW: Switch to activate/deactivate the 26H rule (25->26)
-    if 'force_25_to_26' not in st.session_state:
-        st.session_state['force_25_to_26'] = True
+    # Switch to activate/deactivate the 26H rule (25->26)
     st.checkbox("Activer règle 25h -> 26h (masse horaire statutaire)", value=st.session_state['force_25_to_26'], key="force_25_to_26", help="Si coché, toute masse horaire calculée à 25.0 sera remplacée par 26.0 sur les exports formateur.")
 
     if uploaded_file:
