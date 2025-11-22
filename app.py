@@ -2,11 +2,12 @@
 # Streamlit app dérivé du code partagé par l'utilisateur, modifié pour remplacer S1/S2/S3/S4
 # par des plages de dates exactes détectées dans chaque onglets (ou saisies manuellement).
 # Correction: gestion des titres de feuilles invalides pour openpyxl (sanitize_sheet_title).
+# Modification: Utilisation du logo local Logo_ofppt.png dans l'interface
 #
 # Usage: streamlit run streamlit_app_dates_semaines.py
 #
 # Dépendances: streamlit, pandas, openpyxl, plotly (facultatif pour graphiques existants)
-# Placez Logo_ofppt.png dans le répertoire si vous voulez qu'il apparaisse dans les exports Excel.
+# Placez Logo_ofppt.png dans le répertoire si vous voulez qu'il apparaisse dans les exports Excel et l'interface.
 
 import streamlit as st
 import pandas as pd
@@ -19,6 +20,7 @@ from datetime import datetime, timedelta, date
 import copy
 import os
 import re
+import base64
 
 # Configuration Streamlit
 st.set_page_config(
@@ -39,6 +41,307 @@ st.markdown("""
     .metric-card { background: white; padding: 1.2rem; border-radius: 10px; border-left: 4px solid #2d8659; text-align:center; box-shadow:0 2px 8px rgba(0,0,0,0.06); }
 </style>
 """, unsafe_allow_html=True)
+
+if st.session_state['resolved_data'] is None or not st.session_state['resolved_data']:
+    st.markdown("""
+    <div style="padding:1rem; border:2px dashed #2d8659; border-radius:10px; background:#f0f9f4;">
+        <h3>📂 Bienvenue</h3>
+        <p>Veuillez importer votre fichier Excel depuis le menu latéral pour commencer.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown('<div class="section-header">📋 Instructions</div>', unsafe_allow_html=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### 📥 Format du fichier\n- Fichier Excel (.xlsx/.xls)\n- Onglets: Planning_Mois")
+    with col2:
+        st.markdown("### 📊 Structure\n- Colonnes: Formateur, Salle, créneaux\n- Plusieurs semaines (3/4/5) détectées automatiquement par plage de dates si présentes")
+else:
+    resolved = st.session_state['resolved_data']
+    st.markdown('<div class="section-header">⚙️ Sélection</div>', unsafe_allow_html=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        selected_month = st.selectbox("📅 Mois", list(resolved.keys()))
+    with col2:
+        parsed = resolved[selected_month]
+        semaines_list = parsed.get('semaines', FALLBACK_SEMAINES)
+        selected_semaine = st.selectbox("📆 Semaine (plage de dates)", semaines_list, index=0)
+    week_ranges = parsed.get('week_ranges', {})
+
+    # show holidays summary (JOUR column displays only names)
+    week_start = get_week_start_from_label(selected_month, selected_semaine, week_ranges)
+    holidays_week = []
+    for i, jour in enumerate(JOURS):
+        d = day_date(week_start, i)
+        lbl = is_holiday(d) if d else None
+        if lbl:
+            holidays_week.append({'jour': jour, 'date': d.strftime('%d/%m/%Y') if d else '', 'label': lbl})
+    if holidays_week:
+        st.warning("⚠️ Jours fériés cette semaine (annulation des séances correspondantes dans les exports Excel):")
+        for h in holidays_week:
+            st.write(f"- {h['jour']} {h['date']} — {h['label']}")
+    else:
+        st.info("✅ Aucun jour férié pour la semaine sélectionnée.")
+
+    st.markdown("---")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(f"<div class='metric-card'><div style='font-size:1.4rem;font-weight:700;color:#1e5631'>{len(parsed['formateurs'])}</div><div>Formateurs</div></div>", unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"<div class='metric-card'><div style='font-size:1.4rem;font-weight:700;color:#1e5631'>{len(parsed['groupes'])}</div><div>Groupes</div></div>", unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"<div class='metric-card'><div style='font-size:1.4rem;font-weight:700;color:#1e5631'>{len(parsed['salles'])}</div><div>Salles</div></div>", unsafe_allow_html=True)
+
+    # Tabs
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["👥 Formateurs","📚 Groupes","🚪 Salles & Conflits","📊 Salles Libres Semaine","📈 Charge par Groupe"])
+
+    # Tab1: Formateurs
+    with tab1:
+        st.markdown('<div class="section-header">👥 Consultation / Export par Formateur</div>', unsafe_allow_html=True)
+        selected_form = st.selectbox("Sélectionner un formateur", parsed['formateurs'], key="ui_form")
+        if selected_form:
+            fdata = parsed['schedule'][selected_form]
+            df_view = build_schedule_table_for_formateur(fdata, selected_semaine, selected_month, week_ranges)
+            st.dataframe(df_view, use_container_width=True)
+            # compute hours with same special rule shown in exports (if computed == 25 -> 26) but only if switch enabled
+            heures_calc = compute_hours_for_formateur(fdata, selected_semaine, selected_month, week_ranges)
+            if st.session_state.get('force_25_to_26', True) and abs(heures_calc - 25.0) < 0.01:
+                heures_display = 26.0
+            else:
+                heures_display = heures_calc
+            coll, colr = st.columns([3,1])
+            with coll:
+                st.info(f"🏢 Salle préférée: {fdata['salle']}")
+            with colr:
+                st.metric("Heures (hors fériés)", f"{heures_display:.2f}h")
+            st.markdown("### 📄 Export Excel")
+            if st.button("📥 Générer Excel (Formateur)", key="btn_export_form"):
+                wb = create_excel_formateur_semaine(selected_form, fdata, selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'), force_25_to_26=st.session_state.get('force_25_to_26', True))
+                filename = sanitize_sheet_title(f"EDT_Formateur_{selected_form}_{selected_month}", max_len=80) + ".xlsx"
+                st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
+
+        st.markdown("---")
+        if st.button("📥 Générer Pack Excel (Tous les formateurs)"):
+            with st.spinner("Génération pack..."):
+                wb_final = openpyxl.Workbook()
+                wb_final.remove(wb_final.active)
+                used_names = set()
+                for form in parsed['formateurs']:
+                    wb_temp = create_excel_formateur_semaine(form, parsed['schedule'][form], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'), force_25_to_26=st.session_state.get('force_25_to_26', True))
+                    ws_temp = wb_temp.active
+                    sheet_base = sanitize_sheet_title(f"{form[:25]}_{selected_month}", max_len=31)
+                    sheet_name = sheet_base
+                    i = 1
+                    while sheet_name in used_names:
+                        suffix = f"_{i}"
+                        sheet_name = sanitize_sheet_title(sheet_base[:31-len(suffix)] + suffix)
+                        i += 1
+                    used_names.add(sheet_name)
+                    ws_new = wb_final.create_sheet(title=sheet_name)
+                    # copy entire sheet (styles, merges, sizes) and ensure borders closed only for table area then clear meta
+                    copy_sheet(ws_temp, ws_new)
+
+                filename = sanitize_sheet_title(f"Pack_Formateurs_{selected_month}", max_len=80) + ".xlsx"
+                st.download_button("💾 Télécharger Pack Excel (Formateurs)", excel_to_bytes(wb_final), filename)
+
+    # Tab2: Groupes
+    with tab2:
+        st.markdown('<div class="section-header">📚 Consultation / Export par Groupe</div>', unsafe_allow_html=True)
+        selected_grp = st.selectbox("Sélectionner un groupe", parsed['groupes'], key="ui_grp")
+        if selected_grp:
+            df_grp = build_schedule_table_for_groupe(parsed['schedule'], selected_grp, selected_semaine, selected_month, week_ranges)
+            st.dataframe(df_grp, use_container_width=True)
+            heures_g = compute_hours_for_groupe(parsed['schedule'], selected_grp, selected_semaine, selected_month, week_ranges)
+            st.metric("Heures (hors fériés)", f"{heures_g:.2f}h")
+            if st.button("📥 Générer Excel (Groupe)"):
+                wb = create_excel_groupe_semaine(selected_grp, parsed['schedule'], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
+                filename = sanitize_sheet_title(f"EDT_Groupe_{selected_grp}_{selected_month}", max_len=80) + ".xlsx"
+                st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
+
+        st.markdown("---")
+        if st.button("📥 Générer Pack Excel (Tous les groupes)"):
+            with st.spinner("Génération pack..."):
+                wb_final = openpyxl.Workbook()
+                wb_final.remove(wb_final.active)
+                used_names = set()
+                for groupe in parsed['groupes']:
+                    wb_temp = create_excel_groupe_semaine(groupe, parsed['schedule'], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
+                    ws_temp = wb_temp.active
+                    sheet_base = sanitize_sheet_title(f"{groupe[:25]}_{selected_month}", max_len=31)
+                    sheet_name = sheet_base
+                    i = 1
+                    while sheet_name in used_names:
+                        suffix = f"_{i}"
+                        sheet_name = sanitize_sheet_title(sheet_base[:31-len(suffix)] + suffix)
+                        i += 1
+                    used_names.add(sheet_name)
+                    ws_new = wb_final.create_sheet(title=sheet_name)
+                    copy_sheet(ws_temp, ws_new)
+                filename = sanitize_sheet_title(f"Pack_Groupes_{selected_month}", max_len=80) + ".xlsx"
+                st.download_button("💾 Télécharger Pack Excel (Groupes)", excel_to_bytes(wb_final), filename)
+
+    # Tab3: Salles & Conflits
+    with tab3:
+        st.markdown('<div class="section-header">🚪 Salles & Conflits</div>', unsafe_allow_html=True)
+        colj, colc, cold = st.columns(3)
+        with colj:
+            sel_jour = st.selectbox("Jour", JOURS, key="salle_jour")
+        with colc:
+            sel_cr = st.selectbox("Créneau", CRENEAUX_JOUR, key="salle_cr")
+        salles_libres = get_available_salles(parsed['schedule'], parsed['salles'], selected_semaine, sel_jour, sel_cr) if sel_jour and sel_cr else []
+        st.metric("Salles disponibles", len(salles_libres))
+        if salles_libres:
+            st.write(", ".join(salles_libres))
+        else:
+            st.write("Aucune salle disponible")
+        st.markdown("---")
+        conflits = st.session_state['conflits_log']
+        if conflits.empty:
+            st.info("Aucun conflit détecté.")
+        else:
+            cs = conflits[(conflits['Mois']==selected_month) & (conflits['Semaine']==selected_semaine)]
+            st.dataframe(cs, use_container_width=True)
+            if not cs.empty:
+                b = BytesIO()
+                cs.to_excel(b, index=False, sheet_name='Conflits')
+                b.seek(0)
+                st.download_button("📥 Télécharger Conflits", b.getvalue(), f"Conflits_{selected_month}_{selected_semaine}.xlsx")
+
+    # Tab4: Salles libres synthèse
+    with tab4:
+        st.markdown('<div class="section-header">📊 Synthèse Salles Libres</div>', unsafe_allow_html=True)
+        synth = []
+        week_start = get_week_start_from_label(selected_month, selected_semaine, week_ranges)
+        for jour in JOURS:
+            for c in CRENEAUX_JOUR:
+                key = f"{selected_semaine}-{jour}-{c}"
+                d = day_date(week_start, JOURS.index(jour))
+                holiday = True if (d and is_holiday(d)) else False
+                occ = set()
+                if not holiday:
+                    for f, fd in parsed['schedule'].items():
+                        s = fd['slots'].get(key)
+                        if s and s[0]:
+                            occ.add(s[1].replace(' (CONFLIT NON RESOLU)','').replace(' (Conflit)',''))
+                libres = sorted(list(set(parsed['salles']) - occ))
+                synth.append({'Jour': jour, 'Créneau': c, 'Horaire': HORAIRES[c], 'Nb Salles Libres': len(libres), 'Salles Disponibles': ', '.join(libres) if libres else 'Aucune'})
+        st.dataframe(pd.DataFrame(synth), use_container_width=True)
+
+    # Tab5: Charge par groupe
+    with tab5:
+        st.markdown('<div class="section-header">📈 Analyse de la Charge par Groupe</div>', unsafe_allow_html=True)
+        st.info(f"📅 Analyse pour : **{selected_month} - {selected_semaine}**")
+
+        charge_groupes = []
+        for groupe in parsed['groupes']:
+            heures_total = 0
+            nb_creneaux = 0
+            for jour in JOURS:
+                for creneau in CRENEAUX_JOUR:
+                    slot_key = f"{selected_semaine}-{jour}-{creneau}"
+                    for formateur, f_data in parsed['schedule'].items():
+                        slot_data = f_data['slots'].get(slot_key)
+                        if slot_data and slot_data[0] == groupe:
+                            heures_total += SLOT_DURATIONS[creneau]
+                            nb_creneaux += 1
+                            break
+            charge_groupes.append({'Groupe': groupe, 'Heures de Formation': heures_total, 'Nombre de Créneaux': nb_creneaux})
+
+        if not charge_groupes:
+            st.info("Aucune donnée de charge disponible pour la semaine sélectionnée.")
+        else:
+            df_charge = pd.DataFrame(charge_groupes)
+            if 'Heures de Formation' not in df_charge.columns:
+                st.warning("La colonne 'Heures de Formation' est manquante dans les données ; affichage interrompu.")
+                st.dataframe(df_charge, use_container_width=True)
+            else:
+                df_charge = df_charge.sort_values('Heures de Formation', ascending=False)
+                moyenne_heures = df_charge['Heures de Formation'].mean()
+                col_met1, col_met2, col_met3, col_met4 = st.columns(4)
+                with col_met1:
+                    st.metric("Groupes Total", len(df_charge))
+                with col_met2:
+                    st.metric("Charge Moyenne", f"{moyenne_heures:.1f}h")
+                with col_met3:
+                    st.metric("Charge Minimale", f"{df_charge['Heures de Formation'].min():.1f}h")
+                with col_met4:
+                    st.metric("Charge Maximale", f"{df_charge['Heures de Formation'].max():.1f}h")
+
+                import plotly.graph_objects as go
+                colors = []
+                seuil_bas = moyenne_heures * 0.85
+                seuil_haut = moyenne_heures * 1.15
+                for heures in df_charge['Heures de Formation']:
+                    if heures > seuil_haut:
+                        colors.append('#d32f2f')
+                    elif heures >= seuil_bas and heures <= seuil_haut:
+                        colors.append('#fbc02d')
+                    else:
+                        colors.append('#388e3c')
+                fig = go.Figure(data=[go.Bar(x=df_charge['Groupe'], y=df_charge['Heures de Formation'], text=df_charge['Heures de Formation'].apply(lambda x: f"{x:.1f}h"), textposition='outside', marker=dict(color=colors, line=dict(color='#1e5631', width=1.5)), hovertemplate='<b>%{x}</b><br>Heures: %{y:.1f}h<br><extra></extra>')])
+                fig.add_hline(y=moyenne_heures, line_dash="dash", line_color="#1e5631", annotation_text=f"Moyenne: {moyenne_heures:.1f}h", annotation_position="right")
+                fig.add_hline(y=seuil_haut, line_dash="dot", line_color="#d32f2f", opacity=0.5)
+                fig.add_hline(y=seuil_bas, line_dash="dot", line_color="#388e3c", opacity=0.5)
+                fig.update_layout(title={'text': f'Charge Horaire par Groupe - {selected_month} {selected_semaine}', 'x': 0.5}, xaxis_title='Groupes', yaxis_title='Heures de Formation', plot_bgcolor='white', paper_bgcolor='#f8faf9', height=500, showlegend=False, xaxis=dict(tickangle=-45, gridcolor='lightgray'), yaxis=dict(gridcolor='lightgray'))
+                st.plotly_chart(fig, use_container_width=True)
+                st.markdown("---")
+                def categoriser_charge_moyenne(heures, moyenne, seuil_bas, seuil_haut):
+                    if heures > seuil_haut:
+                        return "🔴 Trop Chargé"
+                    elif heures >= seuil_bas and heures <= seuil_haut:
+                        return "🟡 Chargé"
+                    else:
+                        return "🟢 Normal"
+                df_charge['Catégorie'] = df_charge['Heures de Formation'].apply(lambda x: categoriser_charge_moyenne(x, moyenne_heures, seuil_bas, seuil_haut))
+                df_charge['Écart/Moyenne'] = df_charge['Heures de Formation'] - moyenne_heures
+                df_charge['Écart/Moyenne'] = df_charge['Écart/Moyenne'].apply(lambda x: f"{x:+.1f}h")
+                st.dataframe(df_charge, use_container_width=True)
+                st.markdown("---")
+                st.info(f"""
+                **Légende:**
+                - 🔴 **Trop Chargé**: > {seuil_haut:.1f}h (au-dessus de +15% de la moyenne)
+                - 🟡 **Chargé**: {seuil_bas:.1f}h - {seuil_haut:.1f}h (proche de la moyenne ±15%)
+                - 🟢 **Normal**: < {seuil_bas:.1f}h (inférieur de -15% de la moyenne - Pas chargé)
+                """)
+                col_stat1, col_stat2, col_stat3 = st.columns(3)
+                with col_stat1:
+                    nb_trop_charge = len(df_charge[df_charge['Heures de Formation'] > seuil_haut])
+                    st.markdown(f"""<div class="metric-card" style="border-left-color: #d32f2f;"><div class="metric-value">{nb_trop_charge}</div><div class="metric-label">🔴 Trop Chargés<br/>(Au-dessus moyenne)</div></div>""", unsafe_allow_html=True)
+                with col_stat2:
+                    nb_charge = len(df_charge[(df_charge['Heures de Formation'] >= seuil_bas) & (df_charge['Heures de Formation'] <= seuil_haut)])
+                    st.markdown(f"""<div class="metric-card" style="border-left-color: #fbc02d;"><div class="metric-value">{nb_charge}</div><div class="metric-label">🟡 Chargés<br/>(Proche moyenne)</div></div>""", unsafe_allow_html=True)
+                with col_stat3:
+                    nb_normal = len(df_charge[df_charge['Heures de Formation'] < seuil_bas])
+                    st.markdown(f"""<div class="metric-card" style="border-left-color: #388e3c;"><div class="metric-value">{nb_normal}</div><div class="metric-label">🟢 Normaux<br/>(En bas de la moyenne - Pas chargé)</div></div>""", unsafe_allow_html=True)
+                st.markdown("---")
+                if st.button("📥 Exporter l'Analyse de Charge (Excel)", key="btn_export_charge"):
+                    wb_charge = openpyxl.Workbook()
+                    ws = wb_charge.active
+                    ws.title = sanitize_sheet_title("Charge_Groupes")
+                    ws.sheet_view.showGridLines = False
+                    border_thin = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+                    header_font = Font(bold=True, size=11, color="FFFFFF")
+                    title_font = Font(bold=True, size=14, color="1e5631")
+                    header_fill = PatternFill(start_color="2d8659", end_color="2d8659", fill_type="solid")
+                    center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                    ws['A1'] = f'ANALYSE DE CHARGE PAR GROUPE - {selected_month} {selected_semaine}'
+                    ws.merge_cells('A1:E1'); ws['A1'].font = title_font; ws['A1'].alignment = center_align; ws.row_dimensions[1].height = 25
+                    ws['A2'] = f'Moyenne: {moyenne_heures:.1f}h | Seuils: Normal < {seuil_bas:.1f}h | Chargé: {seuil_bas:.1f}h-{seuil_haut:.1f}h | Trop Chargé > {seuil_haut:.1f}h'
+                    ws.merge_cells('A2:E2'); ws['A2'].alignment = center_align; ws.row_dimensions[2].height = 20
+                    ws['A4'] = 'Groupe'; ws['B4'] = 'Heures de Formation'; ws['C4'] = 'Nombre de Créneaux'; ws['D4'] = 'Niveau de Charge'; ws['E4'] = 'Écart/Moyenne'
+                    for col in ['A','B','C','D','E']:
+                        ws[f'{col}4'].font = header_font; ws[f'{col}4'].fill = header_fill; ws[f'{col}4'].border = border_thin; ws[f'{col}4'].alignment = center_align; ws.column_dimensions[col].width = 25
+                    row = 5
+                    for _, data_row in df_charge.iterrows():
+                        ws[f'A{row}'] = data_row['Groupe']; ws[f'B{row}'] = data_row['Heures de Formation']; ws[f'C{row}'] = data_row['Nombre de Créneaux']; ws[f'D{row}'] = data_row['Catégorie']; ws[f'E{row}'] = data_row['Écart/Moyenne']
+                        for col in ['A','B','C','D','E']:
+                            ws[f'{col}{row}'].border = border_thin; ws[f'{col}{row}'].alignment = center_align
+                        row += 1
+                    excel_bytes = excel_to_bytes(wb_charge)
+                    st.download_button("💾 Télécharger l'Analyse", excel_bytes, f"Charge_Groupes_{selected_month}_{selected_semaine}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+
+# Footer
+st.markdown("---")
+st.markdown("<div style='text-align:center;color:#666;padding:1rem;'>Développé par ISMAILI ALAOUI Mohamed — CFP TLRA/IFMLT</div>", unsafe_allow_html=True)
 
 # --- CONSTANTS ---
 LOGO_FILE_NAME = "Logo_ofppt.png"
@@ -84,6 +387,18 @@ HOLIDAYS = [
 
 HOLIDAY_FILL = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
 HOLIDAY_FONT = Font(bold=True, color="000000")
+
+# --- HELPER FUNCTION FOR LOGO ---
+def get_logo_src():
+    """Retourne le src du logo (base64 si fichier local existe, sinon URL)"""
+    if os.path.exists(LOGO_FILE_NAME):
+        try:
+            with open(LOGO_FILE_NAME, "rb") as f:
+                logo_base64 = base64.b64encode(f.read()).decode()
+            return f"data:image/png;base64,{logo_base64}"
+        except Exception:
+            return LOGO_URL
+    return LOGO_URL
 
 # --- DATE PARSING HELPERS ---
 ARROW_RE = re.compile(r'\s*(?:→|->|–|-)\s*')
@@ -943,7 +1258,12 @@ def get_available_salles(resolved_schedule, all_salles, semaine_label, jour, cre
 
 # --- SIDEBAR: Upload & processing ---
 with st.sidebar:
-    st.image(LOGO_URL, width=200)
+    # Utiliser le logo local s'il existe, sinon l'URL
+    if os.path.exists(LOGO_FILE_NAME):
+        st.image(LOGO_FILE_NAME, width=200)
+    else:
+        st.image(LOGO_URL, width=200)
+    
     st.markdown("---")
     st.markdown("### 📤 Import du Fichier")
     uploaded_file = st.file_uploader("Fichier Excel multi-onglets", type=['xlsx','xls'], accept_multiple_files=False, help="Sélectionnez le fichier contenant les onglets 'Planning_Mois'")
@@ -983,9 +1303,12 @@ with st.sidebar:
     st.info(f"📅 {datetime.now().strftime('%d/%m/%Y')}\n\n🎓 Année 2025-2026")
 
 # --- MAIN UI ---
+# Préparer l'URL ou le chemin du logo pour l'affichage dans le header
+logo_src = get_logo_src()
+
 st.markdown(f"""
 <div class="main-header">
-    <img src="{LOGO_URL}" alt="Logo OFPPT" style="max-width:200px; margin-bottom:1rem;">
+    <img src="{logo_src}" alt="Logo OFPPT" style="max-width:200px; margin-bottom:1rem;">
     <div class="ofppt-title">OFPPT</div>
     <div class="ofppt-subtitle">Office de la Formation Professionnelle et de la Promotion du Travail</div>
     <div style="font-size:1.1rem; margin:0.5rem 0;">CFP TLRA/IFMLT</div>
@@ -993,304 +1316,3 @@ st.markdown(f"""
     <div class="developer-info">⚡ Développé par <strong>ISMAILI ALAOUI Mohamed</strong></div>
 </div>
 """, unsafe_allow_html=True)
-
-if st.session_state['resolved_data'] is None or not st.session_state['resolved_data']:
-    st.markdown("""
-    <div style="padding:1rem; border:2px dashed #2d8659; border-radius:10px; background:#f0f9f4;">
-        <h3>📂 Bienvenue</h3>
-        <p>Veuillez importer votre fichier Excel depuis le menu latéral pour commencer.</p>
-    </div>
-    """, unsafe_allow_html=True)
-    st.markdown('<div class="section-header">📋 Instructions</div>', unsafe_allow_html=True)
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("### 📥 Format du fichier\n- Fichier Excel (.xlsx/.xls)\n- Onglets: Planning_Mois")
-    with col2:
-        st.markdown("### 📊 Structure\n- Colonnes: Formateur, Salle, créneaux\n- Plusieurs semaines (3/4/5) détectées automatiquement par plage de dates si présentes")
-else:
-    resolved = st.session_state['resolved_data']
-    st.markdown('<div class="section-header">⚙️ Sélection</div>', unsafe_allow_html=True)
-    col1, col2 = st.columns(2)
-    with col1:
-        selected_month = st.selectbox("📅 Mois", list(resolved.keys()))
-    with col2:
-        parsed = resolved[selected_month]
-        semaines_list = parsed.get('semaines', FALLBACK_SEMAINES)
-        selected_semaine = st.selectbox("📆 Semaine (plage de dates)", semaines_list, index=0)
-    week_ranges = parsed.get('week_ranges', {})
-
-    # show holidays summary (JOUR column displays only names)
-    week_start = get_week_start_from_label(selected_month, selected_semaine, week_ranges)
-    holidays_week = []
-    for i, jour in enumerate(JOURS):
-        d = day_date(week_start, i)
-        lbl = is_holiday(d) if d else None
-        if lbl:
-            holidays_week.append({'jour': jour, 'date': d.strftime('%d/%m/%Y') if d else '', 'label': lbl})
-    if holidays_week:
-        st.warning("⚠️ Jours fériés cette semaine (annulation des séances correspondantes dans les exports Excel):")
-        for h in holidays_week:
-            st.write(f"- {h['jour']} {h['date']} — {h['label']}")
-    else:
-        st.info("✅ Aucun jour férié pour la semaine sélectionnée.")
-
-    st.markdown("---")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown(f"<div class='metric-card'><div style='font-size:1.4rem;font-weight:700;color:#1e5631'>{len(parsed['formateurs'])}</div><div>Formateurs</div></div>", unsafe_allow_html=True)
-    with c2:
-        st.markdown(f"<div class='metric-card'><div style='font-size:1.4rem;font-weight:700;color:#1e5631'>{len(parsed['groupes'])}</div><div>Groupes</div></div>", unsafe_allow_html=True)
-    with c3:
-        st.markdown(f"<div class='metric-card'><div style='font-size:1.4rem;font-weight:700;color:#1e5631'>{len(parsed['salles'])}</div><div>Salles</div></div>", unsafe_allow_html=True)
-
-    # Tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["👥 Formateurs","📚 Groupes","🚪 Salles & Conflits","📊 Salles Libres Semaine","📈 Charge par Groupe"])
-
-    # Tab1: Formateurs
-    with tab1:
-        st.markdown('<div class="section-header">👥 Consultation / Export par Formateur</div>', unsafe_allow_html=True)
-        selected_form = st.selectbox("Sélectionner un formateur", parsed['formateurs'], key="ui_form")
-        if selected_form:
-            fdata = parsed['schedule'][selected_form]
-            df_view = build_schedule_table_for_formateur(fdata, selected_semaine, selected_month, week_ranges)
-            st.dataframe(df_view, use_container_width=True)
-            # compute hours with same special rule shown in exports (if computed == 25 -> 26) but only if switch enabled
-            heures_calc = compute_hours_for_formateur(fdata, selected_semaine, selected_month, week_ranges)
-            if st.session_state.get('force_25_to_26', True) and abs(heures_calc - 25.0) < 0.01:
-                heures_display = 26.0
-            else:
-                heures_display = heures_calc
-            coll, colr = st.columns([3,1])
-            with coll:
-                st.info(f"🏢 Salle préférée: {fdata['salle']}")
-            with colr:
-                st.metric("Heures (hors fériés)", f"{heures_display:.2f}h")
-            st.markdown("### 📄 Export Excel")
-            if st.button("📥 Générer Excel (Formateur)", key="btn_export_form"):
-                wb = create_excel_formateur_semaine(selected_form, fdata, selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'), force_25_to_26=st.session_state.get('force_25_to_26', True))
-                filename = sanitize_sheet_title(f"EDT_Formateur_{selected_form}_{selected_month}", max_len=80) + ".xlsx"
-                st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
-
-        st.markdown("---")
-        if st.button("📥 Générer Pack Excel (Tous les formateurs)"):
-            with st.spinner("Génération pack..."):
-                wb_final = openpyxl.Workbook()
-                wb_final.remove(wb_final.active)
-                used_names = set()
-                for form in parsed['formateurs']:
-                    wb_temp = create_excel_formateur_semaine(form, parsed['schedule'][form], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'), force_25_to_26=st.session_state.get('force_25_to_26', True))
-                    ws_temp = wb_temp.active
-                    sheet_base = sanitize_sheet_title(f"{form[:25]}_{selected_month}", max_len=31)
-                    sheet_name = sheet_base
-                    i = 1
-                    while sheet_name in used_names:
-                        suffix = f"_{i}"
-                        sheet_name = sanitize_sheet_title(sheet_base[:31-len(suffix)] + suffix)
-                        i += 1
-                    used_names.add(sheet_name)
-                    ws_new = wb_final.create_sheet(title=sheet_name)
-                    # copy entire sheet (styles, merges, sizes) and ensure borders closed only for table area then clear meta
-                    copy_sheet(ws_temp, ws_new)
-
-                filename = sanitize_sheet_title(f"Pack_Formateurs_{selected_month}", max_len=80) + ".xlsx"
-                st.download_button("💾 Télécharger Pack Excel (Formateurs)", excel_to_bytes(wb_final), filename)
-
-    # Tab2: Groupes
-    with tab2:
-        st.markdown('<div class="section-header">📚 Consultation / Export par Groupe</div>', unsafe_allow_html=True)
-        selected_grp = st.selectbox("Sélectionner un groupe", parsed['groupes'], key="ui_grp")
-        if selected_grp:
-            df_grp = build_schedule_table_for_groupe(parsed['schedule'], selected_grp, selected_semaine, selected_month, week_ranges)
-            st.dataframe(df_grp, use_container_width=True)
-            heures_g = compute_hours_for_groupe(parsed['schedule'], selected_grp, selected_semaine, selected_month, week_ranges)
-            st.metric("Heures (hors fériés)", f"{heures_g:.2f}h")
-            if st.button("📥 Générer Excel (Groupe)"):
-                wb = create_excel_groupe_semaine(selected_grp, parsed['schedule'], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
-                filename = sanitize_sheet_title(f"EDT_Groupe_{selected_grp}_{selected_month}", max_len=80) + ".xlsx"
-                st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
-
-        st.markdown("---")
-        if st.button("📥 Générer Pack Excel (Tous les groupes)"):
-            with st.spinner("Génération pack..."):
-                wb_final = openpyxl.Workbook()
-                wb_final.remove(wb_final.active)
-                used_names = set()
-                for groupe in parsed['groupes']:
-                    wb_temp = create_excel_groupe_semaine(groupe, parsed['schedule'], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
-                    ws_temp = wb_temp.active
-                    sheet_base = sanitize_sheet_title(f"{groupe[:25]}_{selected_month}", max_len=31)
-                    sheet_name = sheet_base
-                    i = 1
-                    while sheet_name in used_names:
-                        suffix = f"_{i}"
-                        sheet_name = sanitize_sheet_title(sheet_base[:31-len(suffix)] + suffix)
-                        i += 1
-                    used_names.add(sheet_name)
-                    ws_new = wb_final.create_sheet(title=sheet_name)
-                    copy_sheet(ws_temp, ws_new)
-                filename = sanitize_sheet_title(f"Pack_Groupes_{selected_month}", max_len=80) + ".xlsx"
-                st.download_button("💾 Télécharger Pack Excel (Groupes)", excel_to_bytes(wb_final), filename)
-
-    # Tab3: Salles & Conflits
-    with tab3:
-        st.markdown('<div class="section-header">🚪 Salles & Conflits</div>', unsafe_allow_html=True)
-        colj, colc, cold = st.columns(3)
-        with colj:
-            sel_jour = st.selectbox("Jour", JOURS, key="salle_jour")
-        with colc:
-            sel_cr = st.selectbox("Créneau", CRENEAUX_JOUR, key="salle_cr")
-        salles_libres = get_available_salles(parsed['schedule'], parsed['salles'], selected_semaine, sel_jour, sel_cr) if sel_jour and sel_cr else []
-        st.metric("Salles disponibles", len(salles_libres))
-        if salles_libres:
-            st.write(", ".join(salles_libres))
-        else:
-            st.write("Aucune salle disponible")
-        st.markdown("---")
-        conflits = st.session_state['conflits_log']
-        if conflits.empty:
-            st.info("Aucun conflit détecté.")
-        else:
-            cs = conflits[(conflits['Mois']==selected_month) & (conflits['Semaine']==selected_semaine)]
-            st.dataframe(cs, use_container_width=True)
-            if not cs.empty:
-                b = BytesIO()
-                cs.to_excel(b, index=False, sheet_name='Conflits')
-                b.seek(0)
-                st.download_button("📥 Télécharger Conflits", b.getvalue(), f"Conflits_{selected_month}_{selected_semaine}.xlsx")
-
-    # Tab4: Salles libres synthèse
-    with tab4:
-        st.markdown('<div class="section-header">📊 Synthèse Salles Libres</div>', unsafe_allow_html=True)
-        synth = []
-        week_start = get_week_start_from_label(selected_month, selected_semaine, week_ranges)
-        for jour in JOURS:
-            for c in CRENEAUX_JOUR:
-                key = f"{selected_semaine}-{jour}-{c}"
-                d = day_date(week_start, JOURS.index(jour))
-                holiday = True if (d and is_holiday(d)) else False
-                occ = set()
-                if not holiday:
-                    for f, fd in parsed['schedule'].items():
-                        s = fd['slots'].get(key)
-                        if s and s[0]:
-                            occ.add(s[1].replace(' (CONFLIT NON RESOLU)','').replace(' (Conflit)',''))
-                libres = sorted(list(set(parsed['salles']) - occ))
-                synth.append({'Jour': jour, 'Créneau': c, 'Horaire': HORAIRES[c], 'Nb Salles Libres': len(libres), 'Salles Disponibles': ', '.join(libres) if libres else 'Aucune'})
-        st.dataframe(pd.DataFrame(synth), use_container_width=True)
-
-    # Tab5: Charge par groupe
-    with tab5:
-        st.markdown('<div class="section-header">📈 Analyse de la Charge par Groupe</div>', unsafe_allow_html=True)
-        st.info(f"📅 Analyse pour : **{selected_month} - {selected_semaine}**")
-
-        charge_groupes = []
-        for groupe in parsed['groupes']:
-            heures_total = 0
-            nb_creneaux = 0
-            for jour in JOURS:
-                for creneau in CRENEAUX_JOUR:
-                    slot_key = f"{selected_semaine}-{jour}-{creneau}"
-                    for formateur, f_data in parsed['schedule'].items():
-                        slot_data = f_data['slots'].get(slot_key)
-                        if slot_data and slot_data[0] == groupe:
-                            heures_total += SLOT_DURATIONS[creneau]
-                            nb_creneaux += 1
-                            break
-            charge_groupes.append({'Groupe': groupe, 'Heures de Formation': heures_total, 'Nombre de Créneaux': nb_creneaux})
-
-        if not charge_groupes:
-            st.info("Aucune donnée de charge disponible pour la semaine sélectionnée.")
-        else:
-            df_charge = pd.DataFrame(charge_groupes)
-            if 'Heures de Formation' not in df_charge.columns:
-                st.warning("La colonne 'Heures de Formation' est manquante dans les données ; affichage interrompu.")
-                st.dataframe(df_charge, use_container_width=True)
-            else:
-                df_charge = df_charge.sort_values('Heures de Formation', ascending=False)
-                moyenne_heures = df_charge['Heures de Formation'].mean()
-                col_met1, col_met2, col_met3, col_met4 = st.columns(4)
-                with col_met1:
-                    st.metric("Groupes Total", len(df_charge))
-                with col_met2:
-                    st.metric("Charge Moyenne", f"{moyenne_heures:.1f}h")
-                with col_met3:
-                    st.metric("Charge Minimale", f"{df_charge['Heures de Formation'].min():.1f}h")
-                with col_met4:
-                    st.metric("Charge Maximale", f"{df_charge['Heures de Formation'].max():.1f}h")
-
-                import plotly.graph_objects as go
-                colors = []
-                seuil_bas = moyenne_heures * 0.85
-                seuil_haut = moyenne_heures * 1.15
-                for heures in df_charge['Heures de Formation']:
-                    if heures > seuil_haut:
-                        colors.append('#d32f2f')
-                    elif heures >= seuil_bas and heures <= seuil_haut:
-                        colors.append('#fbc02d')
-                    else:
-                        colors.append('#388e3c')
-                fig = go.Figure(data=[go.Bar(x=df_charge['Groupe'], y=df_charge['Heures de Formation'], text=df_charge['Heures de Formation'].apply(lambda x: f"{x:.1f}h"), textposition='outside', marker=dict(color=colors, line=dict(color='#1e5631', width=1.5)), hovertemplate='<b>%{x}</b><br>Heures: %{y:.1f}h<br><extra></extra>')])
-                fig.add_hline(y=moyenne_heures, line_dash="dash", line_color="#1e5631", annotation_text=f"Moyenne: {moyenne_heures:.1f}h", annotation_position="right")
-                fig.add_hline(y=seuil_haut, line_dash="dot", line_color="#d32f2f", opacity=0.5)
-                fig.add_hline(y=seuil_bas, line_dash="dot", line_color="#388e3c", opacity=0.5)
-                fig.update_layout(title={'text': f'Charge Horaire par Groupe - {selected_month} {selected_semaine}', 'x': 0.5}, xaxis_title='Groupes', yaxis_title='Heures de Formation', plot_bgcolor='white', paper_bgcolor='#f8faf9', height=500, showlegend=False, xaxis=dict(tickangle=-45, gridcolor='lightgray'), yaxis=dict(gridcolor='lightgray'))
-                st.plotly_chart(fig, use_container_width=True)
-                st.markdown("---")
-                def categoriser_charge_moyenne(heures, moyenne, seuil_bas, seuil_haut):
-                    if heures > seuil_haut:
-                        return "🔴 Trop Chargé"
-                    elif heures >= seuil_bas and heures <= seuil_haut:
-                        return "🟡 Chargé"
-                    else:
-                        return "🟢 Normal"
-                df_charge['Catégorie'] = df_charge['Heures de Formation'].apply(lambda x: categoriser_charge_moyenne(x, moyenne_heures, seuil_bas, seuil_haut))
-                df_charge['Écart/Moyenne'] = df_charge['Heures de Formation'] - moyenne_heures
-                df_charge['Écart/Moyenne'] = df_charge['Écart/Moyenne'].apply(lambda x: f"{x:+.1f}h")
-                st.dataframe(df_charge, use_container_width=True)
-                st.markdown("---")
-                st.info(f"""
-                **Légende:**
-                - 🔴 **Trop Chargé**: > {seuil_haut:.1f}h (au-dessus de +15% de la moyenne)
-                - 🟡 **Chargé**: {seuil_bas:.1f}h - {seuil_haut:.1f}h (proche de la moyenne ±15%)
-                - 🟢 **Normal**: < {seuil_bas:.1f}h (inférieur de -15% de la moyenne - Pas chargé)
-                """)
-                col_stat1, col_stat2, col_stat3 = st.columns(3)
-                with col_stat1:
-                    nb_trop_charge = len(df_charge[df_charge['Heures de Formation'] > seuil_haut])
-                    st.markdown(f"""<div class="metric-card" style="border-left-color: #d32f2f;"><div class="metric-value">{nb_trop_charge}</div><div class="metric-label">🔴 Trop Chargés<br/>(Au-dessus moyenne)</div></div>""", unsafe_allow_html=True)
-                with col_stat2:
-                    nb_charge = len(df_charge[(df_charge['Heures de Formation'] >= seuil_bas) & (df_charge['Heures de Formation'] <= seuil_haut)])
-                    st.markdown(f"""<div class="metric-card" style="border-left-color: #fbc02d;"><div class="metric-value">{nb_charge}</div><div class="metric-label">🟡 Chargés<br/>(Proche moyenne)</div></div>""", unsafe_allow_html=True)
-                with col_stat3:
-                    nb_normal = len(df_charge[df_charge['Heures de Formation'] < seuil_bas])
-                    st.markdown(f"""<div class="metric-card" style="border-left-color: #388e3c;"><div class="metric-value">{nb_normal}</div><div class="metric-label">🟢 Normaux<br/>(En bas de la moyenne - Pas chargé)</div></div>""", unsafe_allow_html=True)
-                st.markdown("---")
-                if st.button("📥 Exporter l'Analyse de Charge (Excel)", key="btn_export_charge"):
-                    wb_charge = openpyxl.Workbook()
-                    ws = wb_charge.active
-                    ws.title = sanitize_sheet_title("Charge_Groupes")
-                    ws.sheet_view.showGridLines = False
-                    border_thin = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-                    header_font = Font(bold=True, size=11, color="FFFFFF")
-                    title_font = Font(bold=True, size=14, color="1e5631")
-                    header_fill = PatternFill(start_color="2d8659", end_color="2d8659", fill_type="solid")
-                    center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
-                    ws['A1'] = f'ANALYSE DE CHARGE PAR GROUPE - {selected_month} {selected_semaine}'
-                    ws.merge_cells('A1:E1'); ws['A1'].font = title_font; ws['A1'].alignment = center_align; ws.row_dimensions[1].height = 25
-                    ws['A2'] = f'Moyenne: {moyenne_heures:.1f}h | Seuils: Normal < {seuil_bas:.1f}h | Chargé: {seuil_bas:.1f}h-{seuil_haut:.1f}h | Trop Chargé > {seuil_haut:.1f}h'
-                    ws.merge_cells('A2:E2'); ws['A2'].alignment = center_align; ws.row_dimensions[2].height = 20
-                    ws['A4'] = 'Groupe'; ws['B4'] = 'Heures de Formation'; ws['C4'] = 'Nombre de Créneaux'; ws['D4'] = 'Niveau de Charge'; ws['E4'] = 'Écart/Moyenne'
-                    for col in ['A','B','C','D','E']:
-                        ws[f'{col}4'].font = header_font; ws[f'{col}4'].fill = header_fill; ws[f'{col}4'].border = border_thin; ws[f'{col}4'].alignment = center_align; ws.column_dimensions[col].width = 25
-                    row = 5
-                    for _, data_row in df_charge.iterrows():
-                        ws[f'A{row}'] = data_row['Groupe']; ws[f'B{row}'] = data_row['Heures de Formation']; ws[f'C{row}'] = data_row['Nombre de Créneaux']; ws[f'D{row}'] = data_row['Catégorie']; ws[f'E{row}'] = data_row['Écart/Moyenne']
-                        for col in ['A','B','C','D','E']:
-                            ws[f'{col}{row}'].border = border_thin; ws[f'{col}{row}'].alignment = center_align
-                        row += 1
-                    excel_bytes = excel_to_bytes(wb_charge)
-                    st.download_button("💾 Télécharger l'Analyse", excel_bytes, f"Charge_Groupes_{selected_month}_{selected_semaine}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-
-# Footer
-st.markdown("---")
-st.markdown("<div style='text-align:center;color:#666;padding:1rem;'>Développé par ISMAILI ALAOUI Mohamed — CFP TLRA/IFMLT</div>", unsafe_allow_html=True)
