@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
-# Streamlit app — version complète intégrant :
-# - import/parse des onglets Planning_Mois
-# - résolution défensive des conflits de salles
-# - exports Excel (formateur, groupe, packs) accessibles seulement en mode Admin
-# - affichage logo, en-têtes sobres, signature "Directeur EFP" sous Samedi
-# - orientation paysage, pas de quadrillage pour les exports
-# - édition / suppression de créneaux pour les formateurs
-# - visualisation des créneaux en bas pendant la saisie pour éviter l'oubli
+# Streamlit app dérivé du code partagé par l'utilisateur, modifié pour remplacer S1/S2/S3/S4
+# par des plages de dates exactes détectées dans chaque onglets (ou saisies manuellement).
+# Correction: gestion des titres de feuilles invalides pour openpyxl (sanitize_sheet_title).
+# Modification: Utilisation du logo local Logo_ofppt.png dans l'interface
 #
-# Usage: streamlit run streamlit_app.py
+# Usage: streamlit run app.py
 #
-# Dépendances: streamlit, pandas, openpyxl
+# Dépendances: streamlit, pandas, openpyxl, plotly (facultatif pour graphiques existants)
+# Placez Logo_ofppt.png dans le répertoire si vous voulez qu'il apparaisse dans les exports Excel et l'interface.
 
 import streamlit as st
 import pandas as pd
@@ -24,8 +21,6 @@ import copy
 import os
 import re
 import base64
-import hashlib
-import random
 
 # Configuration Streamlit
 st.set_page_config(
@@ -35,7 +30,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- INITIALIZE SESSION STATE ---
+# --- INITIALIZE SESSION STATE FIRST ---
 if 'raw_data' not in st.session_state:
     st.session_state['raw_data'] = None
 if 'resolved_data' not in st.session_state:
@@ -46,10 +41,6 @@ if 'niveau_global' not in st.session_state:
     st.session_state['niveau_global'] = "1ère Année"
 if 'force_25_to_26' not in st.session_state:
     st.session_state['force_25_to_26'] = True
-if 'mode_formateur' not in st.session_state:
-    st.session_state['mode_formateur'] = False
-if 'is_admin_mode' not in st.session_state:
-    st.session_state['is_admin_mode'] = False
 
 # --- STYLE CSS (interface) ---
 st.markdown("""
@@ -108,8 +99,9 @@ HOLIDAYS = [
 HOLIDAY_FILL = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
 HOLIDAY_FONT = Font(bold=True, color="000000")
 
-# --- HELPERS ---
+# --- HELPER FUNCTION FOR LOGO ---
 def get_logo_src():
+    """Retourne le src du logo (base64 si fichier local existe, sinon URL)"""
     if os.path.exists(LOGO_FILE_NAME):
         try:
             with open(LOGO_FILE_NAME, "rb") as f:
@@ -119,6 +111,7 @@ def get_logo_src():
             return LOGO_URL
     return LOGO_URL
 
+# --- DATE PARSING HELPERS ---
 ARROW_RE = re.compile(r'\s*(?:→|->|–|-)\s*')
 DATE_FORMATS = [
     "%d/%m/%Y","%d/%m/%y","%d %b %Y","%d %B %Y","%d %b %y","%d %B %y","%Y-%m-%d","%d.%m.%Y",
@@ -188,7 +181,6 @@ def find_header_row(df):
             return idx
     return None
 
-# --- PARSING / PROCESSING ---
 @st.cache_data(show_spinner=False)
 def parse_schedule_sheet(df, sheet_name):
     month_name = extract_month_name_from_sheet(sheet_name)
@@ -888,19 +880,6 @@ def get_available_salles(resolved_schedule, all_salles, semaine_label, jour, cre
                 occ.add(s)
     return sorted(list(set(all_salles) - occ))
 
-# Helper to retrieve all groups in DB / uploaded data
-def get_groupes():
-    groupes = set()
-    if st.session_state.get('resolved_data'):
-        for m, data in st.session_state['resolved_data'].items():
-            for g in data.get('groupes', []):
-                groupes.add(g)
-    if not groupes and st.session_state.get('raw_data'):
-        for m, data in st.session_state['raw_data'].items():
-            for g in data.get('groupes', []):
-                groupes.add(g)
-    return sorted(groupes)
-
 # --- SIDEBAR: Upload & processing ---
 with st.sidebar:
     if os.path.exists(LOGO_FILE_NAME):
@@ -914,8 +893,6 @@ with st.sidebar:
     
     st.text_input("Niveau (valeur export)", key="niveau_global", help="Valeur affichée dans 'Niveau' sur les exports (ex: 1ère Année)")
     st.checkbox("Activer règle 25h -> 26h (masse horaire statutaire)", value=st.session_state['force_25_to_26'], key="force_25_to_26", help="Si coché, toute masse horaire calculée à 25.0 sera remplacée par 26.0 sur les exports formateur.")
-    st.checkbox("Mode Formateur (empêche téléchargement individuel)", value=st.session_state['mode_formateur'], key="mode_formateur", help="Si coché, l'interface Formateur permet modification/suppression mais cache le bouton de téléchargement individuel.")
-    st.checkbox("Mode Admin (autorise téléchargements)", value=st.session_state['is_admin_mode'], key="is_admin_mode", help="Si coché, autorise tous les téléchargements (packs & individuels). Pour usage admin uniquement.")
 
     if uploaded_file:
         if st.session_state['raw_data'] is None or uploaded_file != st.session_state.get('uploaded_file_ref'):
@@ -935,19 +912,7 @@ with st.sidebar:
                     st.error("❌ Aucune donnée valide ou erreur de traitement.")
     st.markdown("---")
     st.info(f"📅 {datetime.now().strftime('%d/%m/%Y')}\n\n🎓 Année 2025-2026")
-# DEBUG TEMPORAIRE - coller juste après le header principal (MAIN UI)
-st.markdown("### DEBUG (temporaire) — état session et flags")
-st.write({
-    'fichier_executé': __file__ if '__file__' in globals() else 'unknown',
-    'mode_formateur': st.session_state.get('mode_formateur'),
-    'is_admin_mode': st.session_state.get('is_admin_mode'),
-    'force_25_to_26': st.session_state.get('force_25_to_26'),
-    'raw_data_keys': list(st.session_state.get('raw_data', {}).keys()) if st.session_state.get('raw_data') else [],
-    'resolved_data_keys': list(st.session_state.get('resolved_data', {}).keys()) if st.session_state.get('resolved_data') else [],
-    'uploaded_file_ref': bool(st.session_state.get('uploaded_file_ref', False))
-})
-if st.button("🔁 Forcer rechargement (experimental_rerun)"):
-    st.experimental_rerun()
+
 # --- MAIN UI ---
 logo_src = get_logo_src()
 
@@ -1012,25 +977,13 @@ else:
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["👥 Formateurs","📚 Groupes","🚪 Salles & Conflits","📊 Salles Libres Semaine","📈 Charge par Groupe"])
 
-    # --------------------------
-    # TAB 1: Formateurs (avec édition & suppression)
-    # --------------------------
     with tab1:
-        st.markdown('<div class="section-header">👥 Consultation / Edition / Export par Formateur</div>', unsafe_allow_html=True)
-
+        st.markdown('<div class="section-header">👥 Consultation / Export par Formateur</div>', unsafe_allow_html=True)
         selected_form = st.selectbox("Sélectionner un formateur", parsed['formateurs'], key="ui_form")
-        if not selected_form:
-            st.info("Sélectionnez un formateur pour afficher/modifier ses créneaux.")
-        else:
-            # Données du formateur
+        if selected_form:
             fdata = parsed['schedule'][selected_form]
-
-            # Vue hebdo (visualisation pendant la saisie) - en haut
-            st.markdown("### 📋 Mes créneaux cette semaine (aperçu)")
             df_view = build_schedule_table_for_formateur(fdata, selected_semaine, selected_month, week_ranges)
-            st.dataframe(df_view, use_container_width=True, height=220)
-
-            # Informations et heures
+            st.dataframe(df_view, use_container_width=True)
             heures_calc = compute_hours_for_formateur(fdata, selected_semaine, selected_month, week_ranges)
             if st.session_state.get('force_25_to_26', True) and abs(heures_calc - 25.0) < 0.01:
                 heures_display = 26.0
@@ -1038,141 +991,37 @@ else:
                 heures_display = heures_calc
             coll, colr = st.columns([3,1])
             with coll:
-                st.info(f"🏢 Salle préférée: {fdata.get('salle','Non définie')}")
+                st.info(f"🏢 Salle préférée: {fdata['salle']}")
             with colr:
                 st.metric("Heures (hors fériés)", f"{heures_display:.2f}h")
+            st.markdown("### 📄 Export Excel")
+            if st.button("📥 Générer Excel (Formateur)", key="btn_export_form"):
+                wb = create_excel_formateur_semaine(selected_form, fdata, selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'), force_25_to_26=st.session_state.get('force_25_to_26', True))
+                filename = sanitize_sheet_title(f"EDT_Formateur_{selected_form}_{selected_month}", max_len=80) + ".xlsx"
+                st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
 
-            st.markdown("---")
-            st.markdown("### ✏️ Saisie / Modification d'un créneau")
+        st.markdown("---")
+        if st.button("📥 Générer Pack Excel (Tous les formateurs)"):
+            with st.spinner("Génération pack..."):
+                wb_final = openpyxl.Workbook()
+                wb_final.remove(wb_final.active)
+                used_names = set()
+                for form in parsed['formateurs']:
+                    wb_temp = create_excel_formateur_semaine(form, parsed['schedule'][form], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'), force_25_to_26=st.session_state.get('force_25_to_26', True))
+                    ws_temp = wb_temp.active
+                    sheet_base = sanitize_sheet_title(f"{form[:25]}_{selected_month}", max_len=31)
+                    sheet_name = sheet_base
+                    i = 1
+                    while sheet_name in used_names:
+                        suffix = f"_{i}"
+                        sheet_name = sanitize_sheet_title(sheet_base[:31-len(suffix)] + suffix)
+                        i += 1
+                    used_names.add(sheet_name)
+                    ws_new = wb_final.create_sheet(title=sheet_name)
+                    copy_sheet(ws_temp, ws_new)
+                filename = sanitize_sheet_title(f"Pack_Formateurs_{selected_month}", max_len=80) + ".xlsx"
+                st.download_button("💾 Télécharger Pack Excel (Formateurs)", excel_to_bytes(wb_final), filename)
 
-            # Saisie rapide d'un nouveau créneau (ou préremplissage via édition)
-            col1, col2 = st.columns(2)
-            with col1:
-                saisie_mois = st.selectbox("📅 Mois", list(resolved.keys()), index=list(resolved.keys()).index(selected_month))
-            with col2:
-                saisie_semaine = st.selectbox("📆 Semaine", parsed.get('semaines', FALLBACK_SEMAINES), index=parsed.get('semaines', FALLBACK_SEMAINES).index(selected_semaine))
-
-            st.markdown("---")
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                saisie_jour = st.selectbox("Jour", JOURS, key="saisie_jour_form")
-            with c2:
-                saisie_creneau = st.selectbox("Créneau", CRENEAUX_JOUR, key="saisie_creneau_form", format_func=lambda x: f"{x} ({HORAIRES[x]})")
-            with c3:
-                saisie_groupe = st.text_input("Groupe", key="saisie_groupe_text")
-            saisie_salle = st.text_input("Salle (optionnel)", key="saisie_salle_text")
-
-            st.markdown("---")
-
-            # Visualisation / Liste des créneaux existants (sélection pour édition)
-            st.markdown("#### 🗂️ Liste des créneaux existants (sélectionnez pour éditer)")
-            slots = fdata.get('slots', {})
-            slot_items = []
-            slot_map = {}
-            for key, val in slots.items():
-                grp, salle = val
-                display = f"{key} → {grp}" + (f" / {salle}" if salle else "")
-                slot_items.append(display)
-                slot_map[display] = key
-            if slot_items:
-                selected_slot_display = st.selectbox("Choisir un créneau à éditer", ["-- Aucun --"] + slot_items, key="select_slot_edit")
-            else:
-                selected_slot_display = "-- Aucun --"
-                st.info("Aucun créneau saisi pour ce formateur cette semaine.")
-
-            # Si l'utilisateur choisit un slot existant, pré-remplir les champs
-            if selected_slot_display and selected_slot_display != "-- Aucun --":
-                sel_key = slot_map[selected_slot_display]
-                grp, salle = slots.get(sel_key, ('',''))
-                try:
-                    parts = sel_key.split('-', 2)
-                    if len(parts) == 3:
-                        _, jour_part, creneau_part = parts
-                        st.session_state['saisie_jour_form'] = jour_part
-                        st.session_state['saisie_creneau_form'] = creneau_part
-                        st.session_state['saisie_groupe_text'] = grp
-                        st.session_state['saisie_salle_text'] = salle
-                    else:
-                        for j in JOURS:
-                            if j in sel_key:
-                                st.session_state['saisie_jour_form'] = j
-                                break
-                        for c in CRENEAUX_JOUR:
-                            if c in sel_key:
-                                st.session_state['saisie_creneau_form'] = c
-                                break
-                        st.session_state['saisie_groupe_text'] = grp
-                        st.session_state['saisie_salle_text'] = salle
-                except Exception:
-                    pass
-
-            # Actions: Enregistrer (nouveau ou modification) et Supprimer (si slot sélectionné)
-            col_save, col_del, col_info = st.columns([2,1,2])
-            with col_save:
-                if st.button("💾 Enregistrer / Mettre à jour le créneau", key="btn_save_slot_form"):
-                    if not saisie_groupe or not saisie_groupe.strip():
-                        st.error("❌ Le champ Groupe est requis.")
-                    else:
-                        slot_key = f"{saisie_semaine}-{saisie_jour}-{saisie_creneau}"
-                        try:
-                            raw = st.session_state.get('raw_data', {})
-                            if saisie_mois in raw and selected_form in raw[saisie_mois]['schedule']:
-                                raw[saisie_mois]['schedule'].setdefault(selected_form, {'salle': fdata.get('salle',''), 'slots': {}})
-                                raw[saisie_mois]['schedule'][selected_form]['slots'][slot_key] = (saisie_groupe.strip(), saisie_salle.strip() if saisie_salle else '')
-                                st.session_state['raw_data'] = raw
-                                st.session_state['resolved_data'], st.session_state['conflits_log'] = resolve_salle_conflits(st.session_state['raw_data'])
-                                st.success("✅ Créneau enregistré / mis à jour et conflits re‑calculés.")
-                                st.experimental_rerun()
-                            else:
-                                st.error("❌ Impossible de trouver les données source pour enregistrer (vérifier le mois et le formateur).")
-                        except Exception as e:
-                            st.error(f"❌ Erreur lors de l'enregistrement: {e}")
-
-            with col_del:
-                if st.button("🗑️ Supprimer le créneau sélectionné", key="btn_delete_slot_form"):
-                    if selected_slot_display == "-- Aucun --":
-                        st.warning("⚠️ Aucun créneau sélectionné à supprimer.")
-                    else:
-                        sel_key = slot_map[selected_slot_display]
-                        try:
-                            raw = st.session_state.get('raw_data', {})
-                            if selected_month in raw and selected_form in raw[selected_month]['schedule']:
-                                slots_dict = raw[selected_month]['schedule'][selected_form]['slots']
-                                if sel_key in slots_dict:
-                                    del slots_dict[sel_key]
-                                    st.session_state['raw_data'] = raw
-                                    st.session_state['resolved_data'], st.session_state['conflits_log'] = resolve_salle_conflits(st.session_state['raw_data'])
-                                    st.success("✅ Créneau supprimé et conflits re‑calculés.")
-                                    st.experimental_rerun()
-                                else:
-                                    st.error("❌ Le créneau n'existe plus.")
-                            else:
-                                st.error("❌ Impossible de trouver les données source pour supprimer.")
-                        except Exception as e:
-                            st.error(f"❌ Erreur lors de la suppression: {e}")
-
-            with col_info:
-                if st.session_state.get("mode_formateur", False):
-                    st.info("Mode Formateur activé — téléchargement individuel désactivé.")
-                else:
-                    # Téléchargements accessibles uniquement si mode Admin activé
-                    if st.session_state.get("is_admin_mode", False):
-                        if st.button("📥 Générer Excel (Formateur)", key="btn_export_form"):
-                            wb = create_excel_formateur_semaine(selected_form, fdata, selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'), force_25_to_26=st.session_state.get('force_25_to_26', True))
-                            filename = sanitize_sheet_title(f"EDT_Formateur_{selected_form}_{selected_month}", max_len=80) + ".xlsx"
-                            st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
-                    else:
-                        st.info("🔒 Téléchargements réservés au Mode Admin.")
-
-            # Visualisation répétée en bas pour éviter l'oubli (tableau de contrôle)
-            st.markdown("---")
-            st.markdown("### ✅ Vérifier mes créneaux (contrôle final)")
-            df_view_bottom = build_schedule_table_for_formateur(fdata, selected_semaine, selected_month, week_ranges)
-            st.dataframe(df_view_bottom, use_container_width=True, height=220)
-
-    # --------------------------
-    # TAB 2: Groupes (consultation + pack includes ALL groups in DB)
-    # --------------------------
     with tab2:
         st.markdown('<div class="section-header">📚 Consultation / Export par Groupe</div>', unsafe_allow_html=True)
         selected_grp = st.selectbox("Sélectionner un groupe", parsed['groupes'], key="ui_grp")
@@ -1181,45 +1030,33 @@ else:
             st.dataframe(df_grp, use_container_width=True)
             heures_g = compute_hours_for_groupe(parsed['schedule'], selected_grp, selected_semaine, selected_month, week_ranges)
             st.metric("Heures (hors fériés)", f"{heures_g:.2f}h")
-            if st.session_state.get("is_admin_mode", False):
-                if st.button("📥 Générer Excel (Groupe)"):
-                    wb = create_excel_groupe_semaine(selected_grp, parsed['schedule'], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
-                    filename = sanitize_sheet_title(f"EDT_Groupe_{selected_grp}_{selected_month}", max_len=80) + ".xlsx"
-                    st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
-            else:
-                st.info("🔒 Téléchargements groupes réservés au Mode Admin.")
+            if st.button("📥 Générer Excel (Groupe)"):
+                wb = create_excel_groupe_semaine(selected_grp, parsed['schedule'], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
+                filename = sanitize_sheet_title(f"EDT_Groupe_{selected_grp}_{selected_month}", max_len=80) + ".xlsx"
+                st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
 
         st.markdown("---")
-        if st.session_state.get("is_admin_mode", False):
-            if st.button("📥 Générer Pack Excel (Tous les groupes)"):
-                with st.spinner("Génération pack..."):
-                    wb_final = openpyxl.Workbook()
-                    wb_final.remove(wb_final.active)
-                    used_names = set()
-                    # Pack includes ALL groups in DB (get_groupes())
-                    all_groupes_db = get_groupes()
-                    groups_to_export = sorted(list(set(all_groupes_db))) if all_groupes_db else parsed['groupes']
-                    for groupe in groups_to_export:
-                        wb_temp = create_excel_groupe_semaine(groupe, parsed['schedule'], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
-                        ws_temp = wb_temp.active
-                        sheet_base = sanitize_sheet_title(f"{groupe[:25]}_{selected_month}", max_len=31)
-                        sheet_name = sheet_base
-                        i = 1
-                        while sheet_name in used_names:
-                            suffix = f"_{i}"
-                            sheet_name = sanitize_sheet_title(sheet_base[:31-len(suffix)] + suffix)
-                            i += 1
-                        used_names.add(sheet_name)
-                        ws_new = wb_final.create_sheet(title=sheet_name)
-                        copy_sheet(ws_temp, ws_new)
-                    filename = sanitize_sheet_title(f"Pack_Groupes_{selected_month}", max_len=80) + ".xlsx"
-                    st.download_button("💾 Télécharger Pack Excel (Groupes)", excel_to_bytes(wb_final), filename)
-        else:
-            st.info("🔒 Génération du pack groupes réservée au Mode Admin.")
+        if st.button("📥 Générer Pack Excel (Tous les groupes)"):
+            with st.spinner("Génération pack..."):
+                wb_final = openpyxl.Workbook()
+                wb_final.remove(wb_final.active)
+                used_names = set()
+                for groupe in parsed['groupes']:
+                    wb_temp = create_excel_groupe_semaine(groupe, parsed['schedule'], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
+                    ws_temp = wb_temp.active
+                    sheet_base = sanitize_sheet_title(f"{groupe[:25]}_{selected_month}", max_len=31)
+                    sheet_name = sheet_base
+                    i = 1
+                    while sheet_name in used_names:
+                        suffix = f"_{i}"
+                        sheet_name = sanitize_sheet_title(sheet_base[:31-len(suffix)] + suffix)
+                        i += 1
+                    used_names.add(sheet_name)
+                    ws_new = wb_final.create_sheet(title=sheet_name)
+                    copy_sheet(ws_temp, ws_new)
+                filename = sanitize_sheet_title(f"Pack_Groupes_{selected_month}", max_len=80) + ".xlsx"
+                st.download_button("💾 Télécharger Pack Excel (Groupes)", excel_to_bytes(wb_final), filename)
 
-    # --------------------------
-    # TAB 3: Salles & Conflits
-    # --------------------------
     with tab3:
         st.markdown('<div class="section-header">🚪 Salles & Conflits</div>', unsafe_allow_html=True)
         colj, colc, cold = st.columns(3)
@@ -1241,17 +1078,11 @@ else:
             cs = conflits[(conflits['Mois']==selected_month) & (conflits['Semaine']==selected_semaine)]
             st.dataframe(cs, use_container_width=True)
             if not cs.empty:
-                if st.session_state.get("is_admin_mode", False):
-                    b = BytesIO()
-                    cs.to_excel(b, index=False, sheet_name='Conflits')
-                    b.seek(0)
-                    st.download_button("📥 Télécharger Conflits", b.getvalue(), f"Conflits_{selected_month}_{selected_semaine}.xlsx")
-                else:
-                    st.info("🔒 Téléchargement des conflits réservé au Mode Admin.")
+                b = BytesIO()
+                cs.to_excel(b, index=False, sheet_name='Conflits')
+                b.seek(0)
+                st.download_button("📥 Télécharger Conflits", b.getvalue(), f"Conflits_{selected_month}_{selected_semaine}.xlsx")
 
-    # --------------------------
-    # TAB 4: Synthèse Salles Libres
-    # --------------------------
     with tab4:
         st.markdown('<div class="section-header">📊 Synthèse Salles Libres</div>', unsafe_allow_html=True)
         synth = []
@@ -1271,9 +1102,6 @@ else:
                 synth.append({'Jour': jour, 'Créneau': c, 'Horaire': HORAIRES[c], 'Nb Salles Libres': len(libres), 'Salles Disponibles': ', '.join(libres) if libres else 'Aucune'})
         st.dataframe(pd.DataFrame(synth), use_container_width=True)
 
-    # --------------------------
-    # TAB 5: Charge par Groupe
-    # --------------------------
     with tab5:
         st.markdown('<div class="section-header">📈 Analyse de la Charge par Groupe</div>', unsafe_allow_html=True)
         st.info(f"📅 Analyse pour : **{selected_month} - {selected_semaine}**")
@@ -1360,34 +1188,31 @@ else:
                     nb_normal = len(df_charge[df_charge['Heures de Formation'] < seuil_bas])
                     st.markdown(f"""<div class="metric-card" style="border-left-color: #388e3c;"><div class="metric-value">{nb_normal}</div><div class="metric-label">🟢 Normaux<br/>(En bas de la moyenne - Pas chargé)</div></div>""", unsafe_allow_html=True)
                 st.markdown("---")
-                if st.session_state.get("is_admin_mode", False):
-                    if st.button("📥 Exporter l'Analyse de Charge (Excel)", key="btn_export_charge"):
-                        wb_charge = openpyxl.Workbook()
-                        ws = wb_charge.active
-                        ws.title = sanitize_sheet_title("Charge_Groupes")
-                        ws.sheet_view.showGridLines = False
-                        border_thin = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-                        header_font = Font(bold=True, size=11, color="FFFFFF")
-                        title_font = Font(bold=True, size=14, color="1e5631")
-                        header_fill = PatternFill(start_color="2d8659", end_color="2d8659", fill_type="solid")
-                        center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
-                        ws['A1'] = f'ANALYSE DE CHARGE PAR GROUPE - {selected_month} {selected_semaine}'
-                        ws.merge_cells('A1:E1'); ws['A1'].font = title_font; ws['A1'].alignment = center_align; ws.row_dimensions[1].height = 25
-                        ws['A2'] = f'Moyenne: {moyenne_heures:.1f}h | Seuils: Normal < {seuil_bas:.1f}h | Chargé: {seuil_bas:.1f}h-{seuil_haut:.1f}h | Trop Chargé > {seuil_haut:.1f}h'
-                        ws.merge_cells('A2:E2'); ws['A2'].alignment = center_align; ws.row_dimensions[2].height = 20
-                        ws['A4'] = 'Groupe'; ws['B4'] = 'Heures de Formation'; ws['C4'] = 'Nombre de Créneaux'; ws['D4'] = 'Niveau de Charge'; ws['E4'] = 'Écart/Moyenne'
+                if st.button("📥 Exporter l'Analyse de Charge (Excel)", key="btn_export_charge"):
+                    wb_charge = openpyxl.Workbook()
+                    ws = wb_charge.active
+                    ws.title = sanitize_sheet_title("Charge_Groupes")
+                    ws.sheet_view.showGridLines = False
+                    border_thin = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+                    header_font = Font(bold=True, size=11, color="FFFFFF")
+                    title_font = Font(bold=True, size=14, color="1e5631")
+                    header_fill = PatternFill(start_color="2d8659", end_color="2d8659", fill_type="solid")
+                    center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                    ws['A1'] = f'ANALYSE DE CHARGE PAR GROUPE - {selected_month} {selected_semaine}'
+                    ws.merge_cells('A1:E1'); ws['A1'].font = title_font; ws['A1'].alignment = center_align; ws.row_dimensions[1].height = 25
+                    ws['A2'] = f'Moyenne: {moyenne_heures:.1f}h | Seuils: Normal < {seuil_bas:.1f}h | Chargé: {seuil_bas:.1f}h-{seuil_haut:.1f}h | Trop Chargé > {seuil_haut:.1f}h'
+                    ws.merge_cells('A2:E2'); ws['A2'].alignment = center_align; ws.row_dimensions[2].height = 20
+                    ws['A4'] = 'Groupe'; ws['B4'] = 'Heures de Formation'; ws['C4'] = 'Nombre de Créneaux'; ws['D4'] = 'Niveau de Charge'; ws['E4'] = 'Écart/Moyenne'
+                    for col in ['A','B','C','D','E']:
+                        ws[f'{col}4'].font = header_font; ws[f'{col}4'].fill = header_fill; ws[f'{col}4'].border = border_thin; ws[f'{col}4'].alignment = center_align; ws.column_dimensions[col].width = 25
+                    row = 5
+                    for _, data_row in df_charge.iterrows():
+                        ws[f'A{row}'] = data_row['Groupe']; ws[f'B{row}'] = data_row['Heures de Formation']; ws[f'C{row}'] = data_row['Nombre de Créneaux']; ws[f'D{row}'] = data_row['Catégorie']; ws[f'E{row}'] = data_row['Écart/Moyenne']
                         for col in ['A','B','C','D','E']:
-                            ws[f'{col}4'].font = header_font; ws[f'{col}4'].fill = header_fill; ws[f'{col}4'].border = border_thin; ws[f'{col}4'].alignment = center_align; ws.column_dimensions[col].width = 25
-                        row = 5
-                        for _, data_row in df_charge.iterrows():
-                            ws[f'A{row}'] = data_row['Groupe']; ws[f'B{row}'] = data_row['Heures de Formation']; ws[f'C{row}'] = data_row['Nombre de Créneaux']; ws[f'D{row}'] = data_row['Catégorie']; ws[f'E{row}'] = data_row['Écart/Moyenne']
-                            for col in ['A','B','C','D','E']:
-                                ws[f'{col}{row}'].border = border_thin; ws[f'{col}{row}'].alignment = center_align
-                            row += 1
-                        excel_bytes = excel_to_bytes(wb_charge)
-                        st.download_button("💾 Télécharger l'Analyse", excel_bytes, f"Charge_Groupes_{selected_month}_{selected_semaine}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-                else:
-                    st.info("🔒 Export de l'analyse réservé au Mode Admin.")
+                            ws[f'{col}{row}'].border = border_thin; ws[f'{col}{row}'].alignment = center_align
+                        row += 1
+                    excel_bytes = excel_to_bytes(wb_charge)
+                    st.download_button("💾 Télécharger l'Analyse", excel_bytes, f"Charge_Groupes_{selected_month}_{selected_semaine}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
 st.markdown("---")
 st.markdown("<div style='text-align:center;color:#666;padding:1rem;'>Développé par ISMAILI ALAOUI Mohamed — CFP TLRA/IFMLT</div>", unsafe_allow_html=True)
