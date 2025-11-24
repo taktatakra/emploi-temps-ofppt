@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+# Streamlit app dérivé du code partagé par l'utilisateur, modifié pour remplacer S1/S2/S3/S4
+# par des plages de dates exactes détectées dans chaque onglets (ou saisies manuellement).
+# Correction: gestion des titres de feuilles invalides pour openpyxl (sanitize_sheet_title).
+# Modification: Utilisation du logo local Logo_ofppt.png dans l'interface
+#
+# Usage: streamlit run app.py
+#
+# Dépendances: streamlit, pandas, openpyxl, plotly (facultatif pour graphiques existants)
+# Placez Logo_ofppt.png dans le répertoire si vous voulez qu'il apparaisse dans les exports Excel et l'interface.
+
 import streamlit as st
 import pandas as pd
 import openpyxl
