@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-# Streamlit app dérivé du code partagé par l'utilisateur, modifié pour remplacer S1/S2/S3/S4
-# par des plages de dates exactes détectées dans chaque onglets (ou saisies manuellement).
-# Correction: gestion des titres de feuilles invalides pour openpyxl (sanitize_sheet_title).
-# Modification: Utilisation du logo local Logo_ofppt.png dans l'interface
+# Streamlit app dérivé du code partagé par l'utilisateur, modifié pour appliquer les options personnalisées :
+# - Le pack groupes contient TOUS les groupes existants en base (même sans créneaux)
+# - Même mise en page pour individuel et groupe : logo, sans quadrillage, format paysage
+# - Signature "Directeur EFP" placée en colonne A sous la ligne Samedi
+# - Conservation de la détection des plages de dates, règle 25->26h, résolution défensive des conflits
 #
-# Usage: streamlit run app.py
+# Usage: streamlit run streamlit_app.py
 #
-# Dépendances: streamlit, pandas, openpyxl, plotly (facultatif pour graphiques existants)
-# Placez Logo_ofppt.png dans le répertoire si vous voulez qu'il apparaisse dans les exports Excel et l'interface.
+# Dépendances: streamlit, pandas, openpyxl
 
 import streamlit as st
 import pandas as pd
@@ -21,6 +21,8 @@ import copy
 import os
 import re
 import base64
+import hashlib
+import random
 
 # Configuration Streamlit
 st.set_page_config(
@@ -508,6 +510,7 @@ def _apply_template_title(ws, title_text, heures_text, periode_text, left_meta, 
     ws['B4'].alignment = center_align
 
     for idx, (cell, value) in enumerate(left_meta, start=5):
+        # cell should be like 'A5'
         ws[cell] = value
         ws[cell].font = meta_font_bold
         ws[cell].alignment = Alignment(horizontal='left', vertical='center')
@@ -1041,7 +1044,10 @@ else:
                 wb_final = openpyxl.Workbook()
                 wb_final.remove(wb_final.active)
                 used_names = set()
-                for groupe in parsed['groupes']:
+                # IMPORTANT: pack includes ALL groups in DB, even if they have no slots
+                all_groupes_db = get_groupes()
+                groups_to_export = sorted(list(set(all_groupes_db))) if all_groupes_db else parsed['groupes']
+                for groupe in groups_to_export:
                     wb_temp = create_excel_groupe_semaine(groupe, parsed['schedule'], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
                     ws_temp = wb_temp.active
                     sheet_base = sanitize_sheet_title(f"{groupe[:25]}_{selected_month}", max_len=31)
