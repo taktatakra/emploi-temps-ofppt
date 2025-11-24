@@ -935,7 +935,19 @@ with st.sidebar:
                     st.error("❌ Aucune donnée valide ou erreur de traitement.")
     st.markdown("---")
     st.info(f"📅 {datetime.now().strftime('%d/%m/%Y')}\n\n🎓 Année 2025-2026")
-
+# DEBUG TEMPORAIRE - coller juste après le header principal (MAIN UI)
+st.markdown("### DEBUG (temporaire) — état session et flags")
+st.write({
+    'fichier_executé': __file__ if '__file__' in globals() else 'unknown',
+    'mode_formateur': st.session_state.get('mode_formateur'),
+    'is_admin_mode': st.session_state.get('is_admin_mode'),
+    'force_25_to_26': st.session_state.get('force_25_to_26'),
+    'raw_data_keys': list(st.session_state.get('raw_data', {}).keys()) if st.session_state.get('raw_data') else [],
+    'resolved_data_keys': list(st.session_state.get('resolved_data', {}).keys()) if st.session_state.get('resolved_data') else [],
+    'uploaded_file_ref': bool(st.session_state.get('uploaded_file_ref', False))
+})
+if st.button("🔁 Forcer rechargement (experimental_rerun)"):
+    st.experimental_rerun()
 # --- MAIN UI ---
 logo_src = get_logo_src()
 
