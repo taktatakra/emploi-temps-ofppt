@@ -2,11 +2,11 @@
 # Streamlit app — version complète intégrant :
 # - import/parse des onglets Planning_Mois
 # - résolution défensive des conflits de salles
-# - exports Excel (formateur, groupe, packs)
+# - exports Excel (formateur, groupe, packs) accessibles seulement en mode Admin
 # - affichage logo, en-têtes sobres, signature "Directeur EFP" sous Samedi
 # - orientation paysage, pas de quadrillage pour les exports
-# - édition / suppression de créneaux pour les formateurs (Mode Formateur)
-# - les formateurs en "Mode Formateur" ne peuvent pas télécharger leur EDT individuellement
+# - édition / suppression de créneaux pour les formateurs
+# - visualisation des créneaux en bas pendant la saisie pour éviter l'oubli
 #
 # Usage: streamlit run streamlit_app.py
 #
@@ -48,6 +48,8 @@ if 'force_25_to_26' not in st.session_state:
     st.session_state['force_25_to_26'] = True
 if 'mode_formateur' not in st.session_state:
     st.session_state['mode_formateur'] = False
+if 'is_admin_mode' not in st.session_state:
+    st.session_state['is_admin_mode'] = False
 
 # --- STYLE CSS (interface) ---
 st.markdown("""
@@ -888,7 +890,6 @@ def get_available_salles(resolved_schedule, all_salles, semaine_label, jour, cre
 
 # Helper to retrieve all groups in DB / uploaded data
 def get_groupes():
-    # Priority: resolved_data (post resolution), fallback to raw_data parsed, fallback to empty
     groupes = set()
     if st.session_state.get('resolved_data'):
         for m, data in st.session_state['resolved_data'].items():
@@ -914,6 +915,7 @@ with st.sidebar:
     st.text_input("Niveau (valeur export)", key="niveau_global", help="Valeur affichée dans 'Niveau' sur les exports (ex: 1ère Année)")
     st.checkbox("Activer règle 25h -> 26h (masse horaire statutaire)", value=st.session_state['force_25_to_26'], key="force_25_to_26", help="Si coché, toute masse horaire calculée à 25.0 sera remplacée par 26.0 sur les exports formateur.")
     st.checkbox("Mode Formateur (empêche téléchargement individuel)", value=st.session_state['mode_formateur'], key="mode_formateur", help="Si coché, l'interface Formateur permet modification/suppression mais cache le bouton de téléchargement individuel.")
+    st.checkbox("Mode Admin (autorise téléchargements)", value=st.session_state['is_admin_mode'], key="is_admin_mode", help="Si coché, autorise tous les téléchargements (packs & individuels). Pour usage admin uniquement.")
 
     if uploaded_file:
         if st.session_state['raw_data'] is None or uploaded_file != st.session_state.get('uploaded_file_ref'):
@@ -1011,10 +1013,10 @@ else:
             # Données du formateur
             fdata = parsed['schedule'][selected_form]
 
-            # Vue hebdo (visualisation pendant la saisie)
-            st.markdown("### 📋 Mes créneaux cette semaine")
+            # Vue hebdo (visualisation pendant la saisie) - en haut
+            st.markdown("### 📋 Mes créneaux cette semaine (aperçu)")
             df_view = build_schedule_table_for_formateur(fdata, selected_semaine, selected_month, week_ranges)
-            st.dataframe(df_view, use_container_width=True, height=280)
+            st.dataframe(df_view, use_container_width=True, height=220)
 
             # Informations et heures
             heures_calc = compute_hours_for_formateur(fdata, selected_semaine, selected_month, week_ranges)
@@ -1141,10 +1143,20 @@ else:
                 if st.session_state.get("mode_formateur", False):
                     st.info("Mode Formateur activé — téléchargement individuel désactivé.")
                 else:
-                    if st.button("📥 Générer Excel (Formateur)", key="btn_export_form"):
-                        wb = create_excel_formateur_semaine(selected_form, fdata, selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'), force_25_to_26=st.session_state.get('force_25_to_26', True))
-                        filename = sanitize_sheet_title(f"EDT_Formateur_{selected_form}_{selected_month}", max_len=80) + ".xlsx"
-                        st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
+                    # Téléchargements accessibles uniquement si mode Admin activé
+                    if st.session_state.get("is_admin_mode", False):
+                        if st.button("📥 Générer Excel (Formateur)", key="btn_export_form"):
+                            wb = create_excel_formateur_semaine(selected_form, fdata, selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'), force_25_to_26=st.session_state.get('force_25_to_26', True))
+                            filename = sanitize_sheet_title(f"EDT_Formateur_{selected_form}_{selected_month}", max_len=80) + ".xlsx"
+                            st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
+                    else:
+                        st.info("🔒 Téléchargements réservés au Mode Admin.")
+
+            # Visualisation répétée en bas pour éviter l'oubli (tableau de contrôle)
+            st.markdown("---")
+            st.markdown("### ✅ Vérifier mes créneaux (contrôle final)")
+            df_view_bottom = build_schedule_table_for_formateur(fdata, selected_semaine, selected_month, week_ranges)
+            st.dataframe(df_view_bottom, use_container_width=True, height=220)
 
     # --------------------------
     # TAB 2: Groupes (consultation + pack includes ALL groups in DB)
@@ -1157,35 +1169,41 @@ else:
             st.dataframe(df_grp, use_container_width=True)
             heures_g = compute_hours_for_groupe(parsed['schedule'], selected_grp, selected_semaine, selected_month, week_ranges)
             st.metric("Heures (hors fériés)", f"{heures_g:.2f}h")
-            if st.button("📥 Générer Excel (Groupe)"):
-                wb = create_excel_groupe_semaine(selected_grp, parsed['schedule'], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
-                filename = sanitize_sheet_title(f"EDT_Groupe_{selected_grp}_{selected_month}", max_len=80) + ".xlsx"
-                st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
+            if st.session_state.get("is_admin_mode", False):
+                if st.button("📥 Générer Excel (Groupe)"):
+                    wb = create_excel_groupe_semaine(selected_grp, parsed['schedule'], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
+                    filename = sanitize_sheet_title(f"EDT_Groupe_{selected_grp}_{selected_month}", max_len=80) + ".xlsx"
+                    st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
+            else:
+                st.info("🔒 Téléchargements groupes réservés au Mode Admin.")
 
         st.markdown("---")
-        if st.button("📥 Générer Pack Excel (Tous les groupes)"):
-            with st.spinner("Génération pack..."):
-                wb_final = openpyxl.Workbook()
-                wb_final.remove(wb_final.active)
-                used_names = set()
-                # Pack includes ALL groups in DB (get_groupes())
-                all_groupes_db = get_groupes()
-                groups_to_export = sorted(list(set(all_groupes_db))) if all_groupes_db else parsed['groupes']
-                for groupe in groups_to_export:
-                    wb_temp = create_excel_groupe_semaine(groupe, parsed['schedule'], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
-                    ws_temp = wb_temp.active
-                    sheet_base = sanitize_sheet_title(f"{groupe[:25]}_{selected_month}", max_len=31)
-                    sheet_name = sheet_base
-                    i = 1
-                    while sheet_name in used_names:
-                        suffix = f"_{i}"
-                        sheet_name = sanitize_sheet_title(sheet_base[:31-len(suffix)] + suffix)
-                        i += 1
-                    used_names.add(sheet_name)
-                    ws_new = wb_final.create_sheet(title=sheet_name)
-                    copy_sheet(ws_temp, ws_new)
-                filename = sanitize_sheet_title(f"Pack_Groupes_{selected_month}", max_len=80) + ".xlsx"
-                st.download_button("💾 Télécharger Pack Excel (Groupes)", excel_to_bytes(wb_final), filename)
+        if st.session_state.get("is_admin_mode", False):
+            if st.button("📥 Générer Pack Excel (Tous les groupes)"):
+                with st.spinner("Génération pack..."):
+                    wb_final = openpyxl.Workbook()
+                    wb_final.remove(wb_final.active)
+                    used_names = set()
+                    # Pack includes ALL groups in DB (get_groupes())
+                    all_groupes_db = get_groupes()
+                    groups_to_export = sorted(list(set(all_groupes_db))) if all_groupes_db else parsed['groupes']
+                    for groupe in groups_to_export:
+                        wb_temp = create_excel_groupe_semaine(groupe, parsed['schedule'], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
+                        ws_temp = wb_temp.active
+                        sheet_base = sanitize_sheet_title(f"{groupe[:25]}_{selected_month}", max_len=31)
+                        sheet_name = sheet_base
+                        i = 1
+                        while sheet_name in used_names:
+                            suffix = f"_{i}"
+                            sheet_name = sanitize_sheet_title(sheet_base[:31-len(suffix)] + suffix)
+                            i += 1
+                        used_names.add(sheet_name)
+                        ws_new = wb_final.create_sheet(title=sheet_name)
+                        copy_sheet(ws_temp, ws_new)
+                    filename = sanitize_sheet_title(f"Pack_Groupes_{selected_month}", max_len=80) + ".xlsx"
+                    st.download_button("💾 Télécharger Pack Excel (Groupes)", excel_to_bytes(wb_final), filename)
+        else:
+            st.info("🔒 Génération du pack groupes réservée au Mode Admin.")
 
     # --------------------------
     # TAB 3: Salles & Conflits
@@ -1211,10 +1229,13 @@ else:
             cs = conflits[(conflits['Mois']==selected_month) & (conflits['Semaine']==selected_semaine)]
             st.dataframe(cs, use_container_width=True)
             if not cs.empty:
-                b = BytesIO()
-                cs.to_excel(b, index=False, sheet_name='Conflits')
-                b.seek(0)
-                st.download_button("📥 Télécharger Conflits", b.getvalue(), f"Conflits_{selected_month}_{selected_semaine}.xlsx")
+                if st.session_state.get("is_admin_mode", False):
+                    b = BytesIO()
+                    cs.to_excel(b, index=False, sheet_name='Conflits')
+                    b.seek(0)
+                    st.download_button("📥 Télécharger Conflits", b.getvalue(), f"Conflits_{selected_month}_{selected_semaine}.xlsx")
+                else:
+                    st.info("🔒 Téléchargement des conflits réservé au Mode Admin.")
 
     # --------------------------
     # TAB 4: Synthèse Salles Libres
@@ -1327,31 +1348,34 @@ else:
                     nb_normal = len(df_charge[df_charge['Heures de Formation'] < seuil_bas])
                     st.markdown(f"""<div class="metric-card" style="border-left-color: #388e3c;"><div class="metric-value">{nb_normal}</div><div class="metric-label">🟢 Normaux<br/>(En bas de la moyenne - Pas chargé)</div></div>""", unsafe_allow_html=True)
                 st.markdown("---")
-                if st.button("📥 Exporter l'Analyse de Charge (Excel)", key="btn_export_charge"):
-                    wb_charge = openpyxl.Workbook()
-                    ws = wb_charge.active
-                    ws.title = sanitize_sheet_title("Charge_Groupes")
-                    ws.sheet_view.showGridLines = False
-                    border_thin = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-                    header_font = Font(bold=True, size=11, color="FFFFFF")
-                    title_font = Font(bold=True, size=14, color="1e5631")
-                    header_fill = PatternFill(start_color="2d8659", end_color="2d8659", fill_type="solid")
-                    center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
-                    ws['A1'] = f'ANALYSE DE CHARGE PAR GROUPE - {selected_month} {selected_semaine}'
-                    ws.merge_cells('A1:E1'); ws['A1'].font = title_font; ws['A1'].alignment = center_align; ws.row_dimensions[1].height = 25
-                    ws['A2'] = f'Moyenne: {moyenne_heures:.1f}h | Seuils: Normal < {seuil_bas:.1f}h | Chargé: {seuil_bas:.1f}h-{seuil_haut:.1f}h | Trop Chargé > {seuil_haut:.1f}h'
-                    ws.merge_cells('A2:E2'); ws['A2'].alignment = center_align; ws.row_dimensions[2].height = 20
-                    ws['A4'] = 'Groupe'; ws['B4'] = 'Heures de Formation'; ws['C4'] = 'Nombre de Créneaux'; ws['D4'] = 'Niveau de Charge'; ws['E4'] = 'Écart/Moyenne'
-                    for col in ['A','B','C','D','E']:
-                        ws[f'{col}4'].font = header_font; ws[f'{col}4'].fill = header_fill; ws[f'{col}4'].border = border_thin; ws[f'{col}4'].alignment = center_align; ws.column_dimensions[col].width = 25
-                    row = 5
-                    for _, data_row in df_charge.iterrows():
-                        ws[f'A{row}'] = data_row['Groupe']; ws[f'B{row}'] = data_row['Heures de Formation']; ws[f'C{row}'] = data_row['Nombre de Créneaux']; ws[f'D{row}'] = data_row['Catégorie']; ws[f'E{row}'] = data_row['Écart/Moyenne']
+                if st.session_state.get("is_admin_mode", False):
+                    if st.button("📥 Exporter l'Analyse de Charge (Excel)", key="btn_export_charge"):
+                        wb_charge = openpyxl.Workbook()
+                        ws = wb_charge.active
+                        ws.title = sanitize_sheet_title("Charge_Groupes")
+                        ws.sheet_view.showGridLines = False
+                        border_thin = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+                        header_font = Font(bold=True, size=11, color="FFFFFF")
+                        title_font = Font(bold=True, size=14, color="1e5631")
+                        header_fill = PatternFill(start_color="2d8659", end_color="2d8659", fill_type="solid")
+                        center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+                        ws['A1'] = f'ANALYSE DE CHARGE PAR GROUPE - {selected_month} {selected_semaine}'
+                        ws.merge_cells('A1:E1'); ws['A1'].font = title_font; ws['A1'].alignment = center_align; ws.row_dimensions[1].height = 25
+                        ws['A2'] = f'Moyenne: {moyenne_heures:.1f}h | Seuils: Normal < {seuil_bas:.1f}h | Chargé: {seuil_bas:.1f}h-{seuil_haut:.1f}h | Trop Chargé > {seuil_haut:.1f}h'
+                        ws.merge_cells('A2:E2'); ws['A2'].alignment = center_align; ws.row_dimensions[2].height = 20
+                        ws['A4'] = 'Groupe'; ws['B4'] = 'Heures de Formation'; ws['C4'] = 'Nombre de Créneaux'; ws['D4'] = 'Niveau de Charge'; ws['E4'] = 'Écart/Moyenne'
                         for col in ['A','B','C','D','E']:
-                            ws[f'{col}{row}'].border = border_thin; ws[f'{col}{row}'].alignment = center_align
-                        row += 1
-                    excel_bytes = excel_to_bytes(wb_charge)
-                    st.download_button("💾 Télécharger l'Analyse", excel_bytes, f"Charge_Groupes_{selected_month}_{selected_semaine}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+                            ws[f'{col}4'].font = header_font; ws[f'{col}4'].fill = header_fill; ws[f'{col}4'].border = border_thin; ws[f'{col}4'].alignment = center_align; ws.column_dimensions[col].width = 25
+                        row = 5
+                        for _, data_row in df_charge.iterrows():
+                            ws[f'A{row}'] = data_row['Groupe']; ws[f'B{row}'] = data_row['Heures de Formation']; ws[f'C{row}'] = data_row['Nombre de Créneaux']; ws[f'D{row}'] = data_row['Catégorie']; ws[f'E{row}'] = data_row['Écart/Moyenne']
+                            for col in ['A','B','C','D','E']:
+                                ws[f'{col}{row}'].border = border_thin; ws[f'{col}{row}'].alignment = center_align
+                            row += 1
+                        excel_bytes = excel_to_bytes(wb_charge)
+                        st.download_button("💾 Télécharger l'Analyse", excel_bytes, f"Charge_Groupes_{selected_month}_{selected_semaine}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+                else:
+                    st.info("🔒 Export de l'analyse réservé au Mode Admin.")
 
 st.markdown("---")
 st.markdown("<div style='text-align:center;color:#666;padding:1rem;'>Développé par ISMAILI ALAOUI Mohamed — CFP TLRA/IFMLT</div>", unsafe_allow_html=True)
