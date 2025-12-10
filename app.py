@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# Streamlit app : Gestionnaire d'Emploi du Temps (Mode libre / neutre)
-# - Mode libre : vous pouvez saisir un libellé de mois libre et créer/modifier des semaines (S1, S2, ...)
-# - Si vous importez un fichier Excel, ses onglets/mois sont disponibles mais aucune présélection n'est faite.
-# - Les semaines peuvent être importées depuis l'onglet détecté ou créées manuellement par l'utilisateur.
+# Streamlit app dérivé du code partagé par l'utilisateur, modifié uniquement pour
+# ne PAS présélectionner automatiquement le mois et la semaine (placeholder "-- Choisir --").
+# Le reste du code source principal est conservé (logique, exports, résolution de conflits).
 #
 # Usage: streamlit run app.py
 #
-# Dépendances: streamlit, pandas, openpyxl, plotly
-# Placez Logo_ofppt.png dans le répertoire pour l'utiliser localement.
+# Dépendances: streamlit, pandas, openpyxl, plotly (facultatif pour graphiques existants)
+# Placez Logo_ofppt.png dans le répertoire si vous voulez qu'il apparaisse dans les exports Excel et l'interface.
 
 import streamlit as st
 import pandas as pd
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.drawing.image import Image
+from openpyxl.utils import get_column_letter
 from io import BytesIO
 from datetime import datetime, timedelta, date
 import copy
@@ -22,15 +21,15 @@ import os
 import re
 import base64
 
-# --- Page config ---
+# Configuration Streamlit
 st.set_page_config(
-    page_title="Gestionnaire d'Emploi du Temps - OFPPT (Mode libre)",
+    page_title="Gestionnaire d'Emploi du Temps - OFPPT (Dates exactes)",
     page_icon="📅",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- SESSION STATE defaults ---
+# --- INITIALIZE SESSION STATE FIRST ---
 if 'raw_data' not in st.session_state:
     st.session_state['raw_data'] = None
 if 'resolved_data' not in st.session_state:
@@ -41,18 +40,16 @@ if 'niveau_global' not in st.session_state:
     st.session_state['niveau_global'] = "1ère Année"
 if 'force_25_to_26' not in st.session_state:
     st.session_state['force_25_to_26'] = True
-# custom week ranges keyed by month label (string)
-if 'custom_week_ranges' not in st.session_state:
-    st.session_state['custom_week_ranges'] = {}
 
-# --- STYLE ---
+# --- STYLE CSS (interface) ---
 st.markdown("""
 <style>
-    .main-header { background: linear-gradient(135deg,#1e5631 0%,#2d8659 50%,#1e5631 100%); padding: 2.0rem; border-radius: 12px; margin-bottom: 1.5rem; color: white; text-align:center; }
-    .ofppt-title { font-size: 2.4rem; font-weight: bold; margin-bottom: 0.3rem; }
-    .ofppt-subtitle { font-size: 1.0rem; margin-bottom: 0.5rem; opacity: 0.95; }
-    .section-header { font-size: 1.3rem; color: #1e5631; font-weight: bold; margin: 1.2rem 0 0.8rem 0; padding-bottom: 0.4rem; border-bottom: 2px solid #2d8659; }
-    .metric-card { background: white; padding: 0.9rem; border-radius: 8px; border-left: 4px solid #2d8659; text-align:center; box-shadow:0 1px 6px rgba(0,0,0,0.04); }
+    .main-header { background: linear-gradient(135deg,#1e5631 0%,#2d8659 50%,#1e5631 100%); padding: 2.5rem; border-radius: 15px; margin-bottom: 2rem; color: white; text-align:center; }
+    .ofppt-title { font-size: 3rem; font-weight: bold; margin-bottom: 0.5rem; text-shadow: 2px 2px 4px rgba(0,0,0,0.3); }
+    .ofppt-subtitle { font-size: 1.3rem; margin-bottom: 1rem; opacity: 0.95; }
+    .developer-info { font-size: 0.95rem; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid rgba(255,255,255,0.3); font-style: italic; }
+    .section-header { font-size: 1.8rem; color: #1e5631; font-weight: bold; margin: 2rem 0 1rem 0; padding-bottom: 0.5rem; border-bottom: 3px solid #2d8659; }
+    .metric-card { background: white; padding: 1.2rem; border-radius: 10px; border-left: 4px solid #2d8659; text-align:center; box-shadow:0 2px 8px rgba(0,0,0,0.06); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -89,7 +86,6 @@ MONTH_TO_NUMBER = {
     'Septembre':9,'Octobre':10,'Novembre':11,'Décembre':12
 }
 
-# Example holidays (adjust as needed)
 HOLIDAYS = [
     {'date': datetime(2025,11,6).date(), 'label': 'La Marche Verte'},
     {'date': datetime(2025,11,18).date(), 'label': "Fête de l'Indépendance"},
@@ -102,18 +98,23 @@ HOLIDAYS = [
 HOLIDAY_FILL = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
 HOLIDAY_FONT = Font(bold=True, color="000000")
 
-# --- UTIL ---
+# --- HELPER FUNCTION FOR LOGO ---
 def get_logo_src():
+    """Retourne le src du logo (base64 si fichier local existe, sinon URL)"""
     if os.path.exists(LOGO_FILE_NAME):
         try:
             with open(LOGO_FILE_NAME, "rb") as f:
-                return f"data:image/png;base64,{base64.b64encode(f.read()).decode()}"
+                logo_base64 = base64.b64encode(f.read()).decode()
+            return f"data:image/png;base64,{logo_base64}"
         except Exception:
             return LOGO_URL
     return LOGO_URL
 
+# --- DATE PARSING HELPERS ---
 ARROW_RE = re.compile(r'\s*(?:→|->|–|-)\s*')
-DATE_FORMATS = ["%d/%m/%Y","%d/%m/%y","%d %b %Y","%d %B %Y","%d %b %y","%d %B %y","%Y-%m-%d","%d.%m.%Y"]
+DATE_FORMATS = [
+    "%d/%m/%Y","%d/%m/%y","%d %b %Y","%d %B %Y","%d %b %y","%d %B %y","%Y-%m-%d","%d.%m.%Y",
+]
 
 def try_parse_date(s):
     if not s or not isinstance(s, str):
@@ -146,6 +147,14 @@ def parse_date_range_cell(cell):
             return (d1, d2)
     return (None, None)
 
+def day_date(week_start, offset_days):
+    if week_start is None:
+        return None
+    d = week_start + timedelta(days=offset_days)
+    if isinstance(d, datetime):
+        return d.date()
+    return d
+
 def sanitize_sheet_title(s, max_len=31):
     if s is None:
         return "Sheet1"
@@ -156,24 +165,13 @@ def sanitize_sheet_title(s, max_len=31):
         s = s[:max_len]
     return s
 
-def is_holiday(day_date):
-    if day_date is None:
-        return None
-    if isinstance(day_date, datetime):
-        d = day_date.date()
-    else:
-        d = day_date
-    for h in HOLIDAYS:
-        if h['date'] == d:
-            return h['label']
+def extract_month_name_from_sheet(sheet_name):
+    normalized = sheet_name.replace('Planning_', '').strip()
+    for key, value in MONTH_NAMES.items():
+        if key.lower() in normalized.lower():
+            return value
     return None
 
-def day_date(week_start, offset_days):
-    if week_start is None:
-        return None
-    return week_start + timedelta(days=offset_days)
-
-# --- PARSING of uploaded Excel ---
 def find_header_row(df):
     for idx, row in df.iterrows():
         vals = [str(x).strip() for x in row.values if pd.notna(x)]
@@ -184,7 +182,7 @@ def find_header_row(df):
 
 @st.cache_data(show_spinner=False)
 def parse_schedule_sheet(df, sheet_name):
-    month_name = sheet_name.replace('Planning_', '').strip()
+    month_name = extract_month_name_from_sheet(sheet_name)
     month_label = month_name if month_name else sheet_name
 
     header_idx = find_header_row(df)
@@ -208,7 +206,7 @@ def parse_schedule_sheet(df, sheet_name):
         semaines = [it[0] for it in ordered]
         week_ranges = {it[0]: {'start': it[1], 'end': it[2]} for it in ordered}
     else:
-        semaines = []
+        semaines = FALLBACK_SEMAINES.copy()
         week_ranges = {}
 
     col_form = -1
@@ -284,7 +282,6 @@ def process_uploaded_excel(uploaded_file):
         st.error(f"Erreur import: {e}")
         return {}
 
-# --- CONFLICT RESOLUTION (full) ---
 @st.cache_data(show_spinner=False)
 def resolve_salle_conflits(all_data):
     resolved = copy.deepcopy(all_data)
@@ -347,7 +344,6 @@ def resolve_salle_conflits(all_data):
                             resolved[month_name]['schedule'][f]['slots'][key2] = (req['g2'], assigned)
     return resolved, pd.DataFrame(log)
 
-# --- week helper (prioritize custom week_ranges supplied by user) ---
 def get_week_start_from_label(mois_label, semaine_label, week_ranges):
     if week_ranges and semaine_label in week_ranges:
         return week_ranges[semaine_label]['start']
@@ -357,13 +353,110 @@ def get_week_start_from_label(mois_label, semaine_label, week_ranges):
         first_day = datetime(year, mnum, 1)
         days_until_monday = (7 - first_day.weekday()) % 7
         first_monday = first_day + timedelta(days=days_until_monday) if first_day.weekday() != 0 else first_day
-        m = re.match(r'S(\d+)', str(semaine_label or ''), re.I)
+        m = re.match(r'S(\d+)', semaine_label, re.I)
         if m:
             idx = int(m.group(1)) - 1
             return (first_monday + timedelta(weeks=idx)).date()
     return None
 
-# --- EXCEL export helpers (full functions) ---
+# Helper: format week display label (non-intrusive)
+def format_week_display_label(sem_label, week_ranges):
+    """
+    Retourne un libellé lisible pour une semaine (ex: "S2 — 03/11/2025 → 08/11/2025").
+    Si la semaine n'a pas de plage dans week_ranges, renvoie simplement sem_label.
+    """
+    if not sem_label:
+        return sem_label
+    if week_ranges and sem_label in week_ranges:
+        s = week_ranges[sem_label]['start']
+        e = week_ranges[sem_label]['end']
+        try:
+            return f"{sem_label} — {s.strftime('%d/%m/%Y')} → {e.strftime('%d/%m/%Y')}"
+        except Exception:
+            return sem_label
+    return sem_label
+
+def is_holiday(day_date):
+    if day_date is None:
+        return None
+    if isinstance(day_date, datetime):
+        d = day_date.date()
+    else:
+        d = day_date
+    for h in HOLIDAYS:
+        if h['date'] == d:
+            return h['label']
+    return None
+
+def build_schedule_table_for_formateur(formateur_data, semaine_label, mois_label, week_ranges):
+    week_start = get_week_start_from_label(mois_label, semaine_label, week_ranges)
+    rows = []
+    for i, jour in enumerate(JOURS):
+        d = day_date(week_start, i)
+        holiday = is_holiday(d) if d else None
+        row = {'JOUR': jour}
+        for c in CRENEAUX_JOUR:
+            key = f"{semaine_label}-{jour}-{c}"
+            if holiday:
+                row[c] = ""
+            else:
+                slot = formateur_data['slots'].get(key, ('',''))
+                grp, salle = slot
+                row[c] = f"{grp}\n{salle}" if grp and salle else ""
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+def build_schedule_table_for_groupe(schedule_data, groupe, semaine_label, mois_label, week_ranges):
+    week_start = get_week_start_from_label(mois_label, semaine_label, week_ranges)
+    rows = []
+    for i, jour in enumerate(JOURS):
+        d = day_date(week_start, i)
+        holiday = is_holiday(d) if d else None
+        row = {'JOUR': jour}
+        for c in CRENEAUX_JOUR:
+            key = f"{semaine_label}-{jour}-{c}"
+            if holiday:
+                row[c] = ""
+            else:
+                info = ""
+                for form, fd in schedule_data.items():
+                    s = fd['slots'].get(key)
+                    if s and s[0] == groupe:
+                        info = f"{form}\n{s[1].replace(' (CONFLIT NON RESOLU)',' (Conflit)')}"
+                        break
+                row[c] = info
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+def compute_hours_for_formateur(formateur_data, semaine_label, mois_label, week_ranges):
+    heures = 0.0
+    week_start = get_week_start_from_label(mois_label, semaine_label, week_ranges)
+    for jour_idx, jour in enumerate(JOURS):
+        day_dt = day_date(week_start, jour_idx)
+        if day_dt and is_holiday(day_dt):
+            continue
+        for c in CRENEAUX_JOUR:
+            slot_key = f"{semaine_label}-{jour}-{c}"
+            if slot_key in formateur_data.get('slots', {}):
+                heures += SLOT_DURATIONS.get(c, 0)
+    return heures
+
+def compute_hours_for_groupe(schedule_data, groupe, semaine_label, mois_label, week_ranges):
+    heures = 0.0
+    week_start = get_week_start_from_label(mois_label, semaine_label, week_ranges)
+    for jour_idx, jour in enumerate(JOURS):
+        day_dt = day_date(week_start, jour_idx)
+        if day_dt and is_holiday(day_dt):
+            continue
+        for c in CRENEAUX_JOUR:
+            slot_key = f"{semaine_label}-{jour}-{c}"
+            for fd in schedule_data.values():
+                slot = fd['slots'].get(slot_key)
+                if slot and slot[0] == groupe:
+                    heures += SLOT_DURATIONS.get(c, 0)
+                    break
+    return heures
+
 def add_logo_if_exists(ws, cell='A1'):
     try:
         if os.path.exists(LOGO_FILE_NAME):
@@ -789,36 +882,7 @@ def create_excel_groupe_semaine(groupe, schedule_data, semaine_label, mois_label
 
     return wb
 
-# --- compute hours ---
-def compute_hours_for_formateur(formateur_data, semaine_label, mois_label, week_ranges):
-    heures = 0.0
-    week_start = get_week_start_from_label(mois_label, semaine_label, week_ranges)
-    for jour_idx, jour in enumerate(JOURS):
-        day_dt = day_date(week_start, jour_idx)
-        if day_dt and is_holiday(day_dt):
-            continue
-        for c in CRENEAUX_JOUR:
-            slot_key = f"{semaine_label}-{jour}-{c}"
-            if slot_key in formateur_data.get('slots', {}):
-                heures += SLOT_DURATIONS.get(c, 0)
-    return heures
-
-def compute_hours_for_groupe(schedule_data, groupe, semaine_label, mois_label, week_ranges):
-    heures = 0.0
-    week_start = get_week_start_from_label(mois_label, semaine_label, week_ranges)
-    for jour_idx, jour in enumerate(JOURS):
-        day_dt = day_date(week_start, jour_idx)
-        if day_dt and is_holiday(day_dt):
-            continue
-        for c in CRENEAUX_JOUR:
-            slot_key = f"{semaine_label}-{jour}-{c}"
-            for fd in schedule_data.values():
-                slot = fd['slots'].get(slot_key)
-                if slot and slot[0] == groupe:
-                    heures += SLOT_DURATIONS.get(c, 0)
-                    break
-    return heures
-
+@st.cache_data(show_spinner=False)
 def get_available_salles(resolved_schedule, all_salles, semaine_label, jour, creneau):
     if not all_salles:
         return []
@@ -834,15 +898,17 @@ def get_available_salles(resolved_schedule, all_salles, semaine_label, jour, cre
 
 # --- SIDEBAR: Upload & processing ---
 with st.sidebar:
-    logo_src = get_logo_src()
-    st.image(logo_src, width=200)
+    if os.path.exists(LOGO_FILE_NAME):
+        st.image(LOGO_FILE_NAME, width=200)
+    else:
+        st.image(LOGO_URL, width=200)
+    
     st.markdown("---")
-    st.markdown("### 📤 Import du Fichier (optionnel)")
+    st.markdown("### 📤 Import du Fichier")
     uploaded_file = st.file_uploader("Fichier Excel multi-onglets", type=['xlsx','xls'], accept_multiple_files=False, help="Sélectionnez le fichier contenant les onglets 'Planning_Mois'")
+    
     st.text_input("Niveau (valeur export)", key="niveau_global", help="Valeur affichée dans 'Niveau' sur les exports (ex: 1ère Année)")
     st.checkbox("Activer règle 25h -> 26h (masse horaire statutaire)", value=st.session_state['force_25_to_26'], key="force_25_to_26", help="Si coché, toute masse horaire calculée à 25.0 sera remplacée par 26.0 sur les exports formateur.")
-    st.markdown("---")
-    st.info(f"📅 {datetime.now().strftime('%d/%m/%Y')}\n🎓 Année 2025-2026")
 
     if uploaded_file:
         if st.session_state['raw_data'] is None or uploaded_file != st.session_state.get('uploaded_file_ref'):
@@ -851,215 +917,136 @@ with st.sidebar:
                 st.session_state['uploaded_file_ref'] = uploaded_file
                 if st.session_state['raw_data']:
                     st.session_state['resolved_data'], st.session_state['conflits_log'] = resolve_salle_conflits(st.session_state['raw_data'])
-                    st.success(f"✅ {len(st.session_state['resolved_data'])} mois chargés et conflits traités")
                 else:
                     st.session_state['resolved_data'] = None
                     st.session_state['conflits_log'] = pd.DataFrame()
-                    st.error("❌ Aucune donnée valide détectée dans le fichier.")
+                if st.session_state['resolved_data']:
+                    st.success(f"✅ {len(st.session_state['resolved_data'])} mois chargés et conflits traités")
+                    for month in st.session_state['resolved_data'].keys():
+                        st.caption(f"📅 {month}")
+                else:
+                    st.error("❌ Aucune donnée valide ou erreur de traitement.")
+    st.markdown("---")
+    st.info(f"📅 {datetime.now().strftime('%d/%m/%Y')}\n\n🎓 Année 2025-2026")
 
-# --- MAIN UI header ---
+# --- MAIN UI ---
+logo_src = get_logo_src()
+
 st.markdown(f"""
 <div class="main-header">
-    <div class="ofppt-title">OFPPT — Gestionnaire d'Emploi du Temps</div>
-    <div class="ofppt-subtitle">Mode libre : mois et semaines saisis par l'utilisateur</div>
-    <div style="font-size:0.9rem;margin-top:0.6rem;">CFP TLRA/IFMLT — Développé par ISMAILI ALAOUI Mohamed</div>
+    <img src="{logo_src}" alt="Logo OFPPT" style="max-width:200px; margin-bottom:1rem;">
+    <div class="ofppt-title">OFPPT</div>
+    <div class="ofppt-subtitle">Office de la Formation Professionnelle et de la Promotion du Travail</div>
+    <div style="font-size:1.1rem; margin:0.5rem 0;">CFP TLRA/IFMLT</div>
+    <div style="font-size:1.5rem; margin-top:1rem; font-weight:600;">📅 Gestionnaire d'Emploi du Temps (Dates exactes)</div>
+    <div class="developer-info">⚡ Développé par <strong>ISMAILI ALAOUI Mohamed</strong></div>
 </div>
 """, unsafe_allow_html=True)
 
-resolved = st.session_state.get('resolved_data') or {}
-
-st.markdown('<div class="section-header">⚙️ Sélection du Mois et des Semaines (Mode neutre)</div>', unsafe_allow_html=True)
-
-col1, col2, col3 = st.columns([2,2,2])
-
-with col1:
-    imported_months = list(resolved.keys())
-    imported_choice_options = ["Aucun (mode libre)"] + imported_months if imported_months else ["Aucun (mode libre)"]
-    imported_month_choice = st.selectbox("Mois importé (optionnel)", imported_choice_options, index=0)
-    use_imported = imported_month_choice != "Aucun (mode libre)"
-
-with col2:
-    month_label_input = st.text_input("Mois (libre) — saisissez la dénomination souhaitée", value="")
-    st.caption("Ex: 'Novembre 2025' ou 'Module X - Décembre' (laisser vide si vous voulez utiliser le mois importé)")
-
-with col3:
-    st.write(" ")
-    st.write(" ")
-    if use_imported:
-        st.info(f"Mode mixte : données importées depuis '{imported_month_choice}'. Aucun choix présélectionné.")
-    else:
-        st.info("Mode libre : aucun mois importé sélectionné. Saisissez un libellé de mois ci-dessus.")
-
-# determine active month label (priority: free input > imported > empty)
-if month_label_input.strip():
-    active_month_label = month_label_input.strip()
-elif use_imported:
-    # Do NOT auto-select to comply with 'neutre' requirement: show imported choice but allow the user to keep month_label empty.
-    active_month_label = imported_month_choice  # we still set active label to allow importing weeks; UI will not preselect elsewhere
+if st.session_state['resolved_data'] is None or not st.session_state['resolved_data']:
+    st.markdown("""
+    <div style="padding:1rem; border:2px dashed #2d8659; border-radius:10px; background:#f0f9f4;">
+        <h3>📂 Bienvenue</h3>
+        <p>Veuillez importer votre fichier Excel depuis le menu latéral pour commencer.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    st.markdown('<div class="section-header">📋 Instructions</div>', unsafe_allow_html=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### 📥 Format du fichier\n- Fichier Excel (.xlsx/.xls)\n- Onglets: Planning_Mois")
+    with col2:
+        st.markdown("### 📊 Structure\n- Colonnes: Formateur, Salle, créneaux\n- Plusieurs semaines (3/4/5) détectées automatiquement par plage de dates si présentes")
 else:
-    active_month_label = ""
+    resolved = st.session_state['resolved_data']
+    st.markdown('<div class="section-header">⚙️ Sélection</div>', unsafe_allow_html=True)
+    col1, col2 = st.columns(2)
 
-st.markdown(f"**Mois actif :** {active_month_label or '— aucun — (saisissez un mois)'}")
+    # --- Minimal non-intrusive change: no default proposal for the month selectbox ---
+    with col1:
+        months_list = ["-- Choisir un mois --"] + list(resolved.keys())
+        selected_month = st.selectbox("📅 Mois", months_list, index=0)
+        if selected_month == "-- Choisir un mois --":
+            st.info("Aucun mois sélectionné — sélectionnez explicitement un mois importé pour continuer.")
+            st.stop()
 
-# initialize custom week ranges dict for active month if missing
-if active_month_label and active_month_label not in st.session_state['custom_week_ranges']:
-    st.session_state['custom_week_ranges'][active_month_label] = {}
+    # After explicit month selection proceed
+    with col2:
+        parsed = resolved[selected_month]
+        semaines_list = parsed.get('semaines', FALLBACK_SEMAINES)
+        week_ranges = parsed.get('week_ranges', {})
 
-# If user selected an imported month that contains week_ranges, show option to import them into the active month's custom ranges
-if use_imported and active_month_label:
-    imported_parsed = resolved.get(imported_month_choice)
-    if imported_parsed and imported_parsed.get('week_ranges'):
-        st.markdown("**Semaines détectées dans l'onglet importé :**")
-        for k, v in imported_parsed['week_ranges'].items():
-            st.write(f"- {k} : {v['start'].strftime('%d/%m/%Y')} → {v['end'].strftime('%d/%m/%Y')}")
-        if st.button("Importer ces semaines dans le mois actif"):
-            st.session_state['custom_week_ranges'][active_month_label] = {
-                k: {'start': v['start'], 'end': v['end']} for k, v in imported_parsed['week_ranges'].items()
-            }
-            st.success(f"Semaines importées dans '{active_month_label}'.")
-            st.experimental_rerun()
+        # --- Minimal non-intrusive change: no default proposal for the week selectbox ---
+        weeks_options = ["-- Choisir une semaine --"] + semaines_list
+        selected_semaine = st.selectbox(
+            "📆 Semaine (plage de dates)",
+            weeks_options,
+            index=0,
+            format_func=lambda x: x if x.startswith("--") else format_week_display_label(x, week_ranges)
+        )
+        if selected_semaine == "-- Choisir une semaine --":
+            st.info("Aucune semaine sélectionnée — sélectionnez explicitement une semaine pour continuer.")
+            st.stop()
+
+    week_ranges = parsed.get('week_ranges', {})
+
+    week_start = get_week_start_from_label(selected_month, selected_semaine, week_ranges)
+    holidays_week = []
+    for i, jour in enumerate(JOURS):
+        d = day_date(week_start, i)
+        lbl = is_holiday(d) if d else None
+        if lbl:
+            holidays_week.append({'jour': jour, 'date': d.strftime('%d/%m/%Y') if d else '', 'label': lbl})
+    if holidays_week:
+        st.warning("⚠️ Jours fériés cette semaine (annulation des séances correspondantes dans les exports Excel):")
+        for h in holidays_week:
+            st.write(f"- {h['jour']} {h['date']} — {h['label']}")
     else:
-        st.info("Aucune plage de semaines détectée dans l'onglet importé (vous pouvez créer des semaines manuellement).")
+        st.info("✅ Aucun jour férié pour la semaine sélectionnée.")
 
-# --- Week creation UI ---
-st.markdown('<div class="section-header">🗓️ Gestion des Semaines (créez votre proposition neutre)</div>', unsafe_allow_html=True)
+    st.markdown("---")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(f"<div class='metric-card'><div style='font-size:1.4rem;font-weight:700;color:#1e5631'>{len(parsed['formateurs'])}</div><div>Formateurs</div></div>", unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"<div class='metric-card'><div style='font-size:1.4rem;font-weight:700;color:#1e5631'>{len(parsed['groupes'])}</div><div>Groupes</div></div>", unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"<div class='metric-card'><div style='font-size:1.4rem;font-weight:700;color:#1e5631'>{len(parsed['salles'])}</div><div>Salles</div></div>", unsafe_allow_html=True)
 
-if not active_month_label:
-    st.warning("Saisissez d'abord un libellé pour le mois (champ 'Mois (libre)') ou sélectionnez un mois importé pour activer la création de semaines.")
-else:
-    wk_col1, wk_col2, wk_col3, wk_col4 = st.columns([2,2,1,1])
-    with wk_col1:
-        new_week_label = st.text_input("Label semaine (ex: S1)", value="S1", key=f"new_week_label_{active_month_label}")
-    with wk_col2:
-        today = date.today()
-        new_start = st.date_input("Début (lundi recommandé)", value=today, key=f"new_week_start_{active_month_label}")
-        new_end = st.date_input("Fin (samedi recommandé)", value=new_start + timedelta(days=5), key=f"new_week_end_{active_month_label}")
-    with wk_col3:
-        if st.button("Ajouter / Mettre à jour semaine", key=f"btn_add_week_{active_month_label}"):
-            label = str(new_week_label).strip() or f"S{len(st.session_state['custom_week_ranges'].get(active_month_label, {}))+1}"
-            if new_end < new_start:
-                st.error("La date de fin doit être postérieure ou égale à la date de début.")
-            else:
-                st.session_state['custom_week_ranges'].setdefault(active_month_label, {})
-                st.session_state['custom_week_ranges'][active_month_label][label] = {'start': new_start, 'end': new_end}
-                st.success(f"Semaine {label} enregistrée pour '{active_month_label}'.")
-                st.experimental_rerun()
-    with wk_col4:
-        if st.button("Vider toutes les semaines du mois", key=f"btn_clear_weeks_{active_month_label}"):
-            if active_month_label in st.session_state['custom_week_ranges']:
-                st.session_state['custom_week_ranges'][active_month_label] = {}
-                st.success(f"Toutes les semaines pour '{active_month_label}' ont été effacées.")
-                st.experimental_rerun()
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["👥 Formateurs","📚 Groupes","🚪 Salles & Conflits","📊 Salles Libres Semaine","📈 Charge par Groupe"])
 
-    # Display current weeks
-    st.markdown("#### Semaines actuellement définies pour le mois actif")
-    cw = st.session_state['custom_week_ranges'].get(active_month_label, {})
-    if not cw:
-        st.info("Aucune semaine définie. Ajoutez-en une à gauche ou importez depuis l'onglet importé.")
-    else:
-        rows = []
-        for k, v in cw.items():
-            rows.append({'Label': k, 'Début': v['start'].strftime('%d/%m/%Y'), 'Fin': v['end'].strftime('%d/%m/%Y')})
-        df_cw = pd.DataFrame(rows)
-        st.dataframe(df_cw, use_container_width=True)
-
-        st.markdown("Supprimer une semaine :")
-        del_label = st.selectbox("Sélectionner une semaine à supprimer", options=["--"] + sorted(list(cw.keys())), index=0, key=f"del_label_select_{active_month_label}")
-        if del_label and del_label != "--":
-            if st.button("Supprimer la semaine sélectionnée", key=f"btn_del_week_{active_month_label}"):
-                st.session_state['custom_week_ranges'][active_month_label].pop(del_label, None)
-                st.success(f"Semaine {del_label} supprimée.")
-                st.experimental_rerun()
-
-# --- Selection of active semaine (no default) ---
-st.markdown('<div class="section-header">🔎 Choix de la semaine active (aucune présélection)</div>', unsafe_allow_html=True)
-
-selected_semaine = None
-active_week_ranges = st.session_state['custom_week_ranges'].get(active_month_label, {}) if active_month_label else {}
-if not active_month_label:
-    st.info("Aucune semaine possible tant que le mois actif n'est pas défini.")
-else:
-    def format_week_display_label_value(x):
-        if x == "-- Aucune --":
-            return x
-        if not x:
-            return "-- Aucune --"
-        if x in active_week_ranges:
-            s = active_week_ranges[x]['start']
-            e = active_week_ranges[x]['end']
-            return f"{x} — {s.strftime('%d/%m/%Y')} → {e.strftime('%d/%m/%Y')}"
-        return x
-    week_options = ["-- Aucune --"] + sorted(list(active_week_ranges.keys()), key=lambda x: int(re.sub(r'\D', '', x) or 0))
-    sel = st.selectbox("Semaine (choisissez dans les semaines définies ci-dessus)", options=week_options, index=0, format_func=lambda x: format_week_display_label_value(x))
-    if sel and sel != "-- Aucune --":
-        selected_semaine = sel
-    else:
-        selected_semaine = None
-
-# --- Inform user about imported data linkage ---
-parsed = resolved.get(imported_month_choice) if use_imported else None
-
-st.markdown('---')
-
-if not parsed:
-    st.warning("Aucune donnée importée pour le mois actif. En mode neutre, vous pouvez définir mois/semaines librement mais il n'y a pas d'emplois (importez un fichier pour afficher/exporter des plannings).")
-else:
-    st.success(f"Données importées pour le mois : {imported_month_choice}. Utilisez un libellé libre pour l'export si souhaité.")
-
-# --- Tabs ---
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["👥 Formateurs","📚 Groupes","🚪 Salles & Conflits","📊 Salles Libres Semaine","📈 Charge par Groupe"])
-
-with tab1:
-    st.markdown('<div class="section-header">👥 Consultation / Export par Formateur</div>', unsafe_allow_html=True)
-    if not parsed:
-        st.info("Aucune donnée importée à afficher ici. Importez un fichier et sélectionnez le mois importé pour utiliser cette section.")
-    else:
-        selected_form = st.selectbox("Sélectionner un formateur", parsed['formateurs'], key="ui_form_lib")
-        if selected_form and selected_semaine:
+    with tab1:
+        st.markdown('<div class="section-header">👥 Consultation / Export par Formateur</div>', unsafe_allow_html=True)
+        selected_form = st.selectbox("Sélectionner un formateur", parsed['formateurs'], key="ui_form")
+        if selected_form:
             fdata = parsed['schedule'][selected_form]
-            # build table
-            rows = []
-            week_start = get_week_start_from_label(active_month_label or imported_month_choice, selected_semaine, active_week_ranges or parsed.get('week_ranges', {}))
-            for i, jour in enumerate(JOURS):
-                d = day_date(week_start, i) if week_start else None
-                holiday = is_holiday(d) if d else None
-                row = {'JOUR': jour}
-                for c in CRENEAUX_JOUR:
-                    key = f"{selected_semaine}-{jour}-{c}"
-                    if holiday:
-                        row[c] = ""
-                    else:
-                        slot = fdata['slots'].get(key, ('',''))
-                        grp, salle = slot
-                        row[c] = f"{grp}\n{salle}" if grp and salle else ""
-                rows.append(row)
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
-
-            heures_calc = compute_hours_for_formateur(fdata, selected_semaine, active_month_label or imported_month_choice, active_week_ranges or parsed.get('week_ranges', {}))
+            df_view = build_schedule_table_for_formateur(fdata, selected_semaine, selected_month, week_ranges)
+            st.dataframe(df_view, use_container_width=True)
+            heures_calc = compute_hours_for_formateur(fdata, selected_semaine, selected_month, week_ranges)
             if st.session_state.get('force_25_to_26', True) and abs(heures_calc - 25.0) < 0.01:
                 heures_display = 26.0
             else:
                 heures_display = heures_calc
-            st.metric("Heures (hors fériés)", f"{heures_display:.2f}h")
-
+            coll, colr = st.columns([3,1])
+            with coll:
+                st.info(f"🏢 Salle préférée: {fdata['salle']}")
+            with colr:
+                st.metric("Heures (hors fériés)", f"{heures_display:.2f}h")
             st.markdown("### 📄 Export Excel")
-            if st.button("📥 Générer Excel (Formateur)"):
-                wb = create_excel_formateur_semaine(selected_form, fdata, selected_semaine, active_month_label or imported_month_choice, active_week_ranges or parsed.get('week_ranges', {}), niveau=st.session_state.get('niveau_global','1ère Année'), force_25_to_26=st.session_state.get('force_25_to_26', True))
-                filename = sanitize_sheet_title(f"EDT_Formateur_{selected_form}_{active_month_label or imported_month_choice}", max_len=80) + ".xlsx"
+            if st.button("📥 Générer Excel (Formateur)", key="btn_export_form"):
+                wb = create_excel_formateur_semaine(selected_form, fdata, selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'), force_25_to_26=st.session_state.get('force_25_to_26', True))
+                filename = sanitize_sheet_title(f"EDT_Formateur_{selected_form}_{selected_month}", max_len=80) + ".xlsx"
                 st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
-        else:
-            st.info("Sélectionnez d'abord une semaine définie et un formateur.")
 
         st.markdown("---")
-        if parsed and st.button("📥 Générer Pack Excel (Tous les formateurs)"):
+        if st.button("📥 Générer Pack Excel (Tous les formateurs)"):
             with st.spinner("Génération pack..."):
                 wb_final = openpyxl.Workbook()
                 wb_final.remove(wb_final.active)
                 used_names = set()
                 for form in parsed['formateurs']:
-                    wb_temp = create_excel_formateur_semaine(form, parsed['schedule'][form], selected_semaine or (parsed['semaines'][0] if parsed['semaines'] else None), active_month_label or imported_month_choice, active_week_ranges or parsed.get('week_ranges', {}), niveau=st.session_state.get('niveau_global','1ère Année'), force_25_to_26=st.session_state.get('force_25_to_26', True))
+                    wb_temp = create_excel_formateur_semaine(form, parsed['schedule'][form], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'), force_25_to_26=st.session_state.get('force_25_to_26', True))
                     ws_temp = wb_temp.active
-                    sheet_base = sanitize_sheet_title(f"{form[:25]}_{active_month_label or imported_month_choice}", max_len=31)
+                    sheet_base = sanitize_sheet_title(f"{form[:25]}_{selected_month}", max_len=31)
                     sheet_name = sheet_base
                     i = 1
                     while sheet_name in used_names:
@@ -1069,54 +1056,32 @@ with tab1:
                     used_names.add(sheet_name)
                     ws_new = wb_final.create_sheet(title=sheet_name)
                     copy_sheet(ws_temp, ws_new)
-                filename = sanitize_sheet_title(f"Pack_Formateurs_{active_month_label or imported_month_choice}", max_len=80) + ".xlsx"
+                filename = sanitize_sheet_title(f"Pack_Formateurs_{selected_month}", max_len=80) + ".xlsx"
                 st.download_button("💾 Télécharger Pack Excel (Formateurs)", excel_to_bytes(wb_final), filename)
 
-with tab2:
-    st.markdown('<div class="section-header">📚 Consultation / Export par Groupe</div>', unsafe_allow_html=True)
-    if not parsed:
-        st.info("Aucune donnée importée à afficher ici.")
-    else:
-        selected_grp = st.selectbox("Sélectionner un groupe", parsed['groupes'], key="ui_grp_lib")
-        if selected_grp and selected_semaine:
-            # build groupe table
-            rows = []
-            week_start = get_week_start_from_label(active_month_label or imported_month_choice, selected_semaine, active_week_ranges or parsed.get('week_ranges', {}))
-            for i, jour in enumerate(JOURS):
-                d = day_date(week_start, i) if week_start else None
-                holiday = is_holiday(d) if d else None
-                row = {'JOUR': jour}
-                for c in CRENEAUX_JOUR:
-                    key = f"{selected_semaine}-{jour}-{c}"
-                    info = ""
-                    for f, fd in parsed['schedule'].items():
-                        s = fd['slots'].get(key)
-                        if s and s[0] == selected_grp:
-                            info = f"{f}\n{s[1].replace(' (CONFLIT NON RESOLU)',' (Conflit)')}"
-                            break
-                    row[c] = info
-                rows.append(row)
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
-            heures_g = compute_hours_for_groupe(parsed['schedule'], selected_grp, selected_semaine, active_month_label or imported_month_choice, active_week_ranges or parsed.get('week_ranges', {}))
+    with tab2:
+        st.markdown('<div class="section-header">📚 Consultation / Export par Groupe</div>', unsafe_allow_html=True)
+        selected_grp = st.selectbox("Sélectionner un groupe", parsed['groupes'], key="ui_grp")
+        if selected_grp:
+            df_grp = build_schedule_table_for_groupe(parsed['schedule'], selected_grp, selected_semaine, selected_month, week_ranges)
+            st.dataframe(df_grp, use_container_width=True)
+            heures_g = compute_hours_for_groupe(parsed['schedule'], selected_grp, selected_semaine, selected_month, week_ranges)
             st.metric("Heures (hors fériés)", f"{heures_g:.2f}h")
-
             if st.button("📥 Générer Excel (Groupe)"):
-                wb = create_excel_groupe_semaine(selected_grp, parsed['schedule'], selected_semaine, active_month_label or imported_month_choice, active_week_ranges or parsed.get('week_ranges', {}), niveau=st.session_state.get('niveau_global','1ère Année'))
-                filename = sanitize_sheet_title(f"EDT_Groupe_{selected_grp}_{active_month_label or imported_month_choice}", max_len=80) + ".xlsx"
+                wb = create_excel_groupe_semaine(selected_grp, parsed['schedule'], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
+                filename = sanitize_sheet_title(f"EDT_Groupe_{selected_grp}_{selected_month}", max_len=80) + ".xlsx"
                 st.download_button("💾 Télécharger Excel", excel_to_bytes(wb), filename)
-        else:
-            st.info("Sélectionnez d'abord une semaine définie et un groupe.")
 
         st.markdown("---")
-        if parsed and st.button("📥 Générer Pack Excel (Tous les groupes)"):
+        if st.button("📥 Générer Pack Excel (Tous les groupes)"):
             with st.spinner("Génération pack..."):
                 wb_final = openpyxl.Workbook()
                 wb_final.remove(wb_final.active)
                 used_names = set()
                 for groupe in parsed['groupes']:
-                    wb_temp = create_excel_groupe_semaine(groupe, parsed['schedule'], selected_semaine or (parsed['semaines'][0] if parsed['semaines'] else None), active_month_label or imported_month_choice, active_week_ranges or parsed.get('week_ranges', {}), niveau=st.session_state.get('niveau_global','1ère Année'))
+                    wb_temp = create_excel_groupe_semaine(groupe, parsed['schedule'], selected_semaine, selected_month, week_ranges, niveau=st.session_state.get('niveau_global','1ère Année'))
                     ws_temp = wb_temp.active
-                    sheet_base = sanitize_sheet_title(f"{groupe[:25]}_{active_month_label or imported_month_choice}", max_len=31)
+                    sheet_base = sanitize_sheet_title(f"{groupe[:25]}_{selected_month}", max_len=31)
                     sheet_name = sheet_base
                     i = 1
                     while sheet_name in used_names:
@@ -1126,93 +1091,82 @@ with tab2:
                     used_names.add(sheet_name)
                     ws_new = wb_final.create_sheet(title=sheet_name)
                     copy_sheet(ws_temp, ws_new)
-                filename = sanitize_sheet_title(f"Pack_Groupes_{active_month_label or imported_month_choice}", max_len=80) + ".xlsx"
+                filename = sanitize_sheet_title(f"Pack_Groupes_{selected_month}", max_len=80) + ".xlsx"
                 st.download_button("💾 Télécharger Pack Excel (Groupes)", excel_to_bytes(wb_final), filename)
 
-with tab3:
-    st.markdown('<div class="section-header">🚪 Salles & Conflits</div>', unsafe_allow_html=True)
-    colj, colc, cold = st.columns(3)
-    with colj:
-        sel_jour = st.selectbox("Jour", JOURS, key="salle_jour")
-    with colc:
-        sel_cr = st.selectbox("Créneau", CRENEAUX_JOUR, key="salle_cr")
-    if not parsed:
-        st.info("Aucune donnée importée — pas de conflits détectables en mode neutre.")
-    else:
-        salles_libres = get_available_salles(parsed['schedule'], parsed['salles'], selected_semaine or (parsed['semaines'][0] if parsed['semaines'] else ''), sel_jour, sel_cr) if sel_jour and sel_cr else []
+    with tab3:
+        st.markdown('<div class="section-header">🚪 Salles & Conflits</div>', unsafe_allow_html=True)
+        colj, colc, cold = st.columns(3)
+        with colj:
+            sel_jour = st.selectbox("Jour", JOURS, key="salle_jour")
+        with colc:
+            sel_cr = st.selectbox("Créneau", CRENEAUX_JOUR, key="salle_cr")
+        salles_libres = get_available_salles(parsed['schedule'], parsed['salles'], selected_semaine, sel_jour, sel_cr) if sel_jour and sel_cr else []
         st.metric("Salles disponibles", len(salles_libres))
         if salles_libres:
             st.write(", ".join(salles_libres))
         else:
             st.write("Aucune salle disponible")
-
         st.markdown("---")
         conflits = st.session_state['conflits_log']
         if conflits.empty:
             st.info("Aucun conflit détecté.")
         else:
-            cs = conflits
-            if use_imported and imported_month_choice:
-                cs = conflits[(conflits['Mois']==imported_month_choice) & (conflits['Semaine']==selected_semaine)] if selected_semaine else conflits[conflits['Mois']==imported_month_choice]
+            cs = conflits[(conflits['Mois']==selected_month) & (conflits['Semaine']==selected_semaine)]
             st.dataframe(cs, use_container_width=True)
             if not cs.empty:
                 b = BytesIO()
                 cs.to_excel(b, index=False, sheet_name='Conflits')
                 b.seek(0)
-                st.download_button("📥 Télécharger Conflits", b.getvalue(), f"Conflits_{imported_month_choice or 'ALL'}_{selected_semaine or 'ALL'}.xlsx")
+                st.download_button("📥 Télécharger Conflits", b.getvalue(), f"Conflits_{selected_month}_{selected_semaine}.xlsx")
 
-with tab4:
-    st.markdown('<div class="section-header">📊 Synthèse Salles Libres</div>', unsafe_allow_html=True)
-    if not parsed:
-        st.info("Aucune donnée importée : synthèse non disponible.")
-    else:
-        if not selected_semaine:
-            st.info("Sélectionnez une semaine définie pour obtenir la synthèse des salles libres.")
-        else:
-            synth = []
-            week_start = get_week_start_from_label(active_month_label or imported_month_choice, selected_semaine, active_week_ranges or parsed.get('week_ranges', {}))
+    with tab4:
+        st.markdown('<div class="section-header">📊 Synthèse Salles Libres</div>', unsafe_allow_html=True)
+        synth = []
+        week_start = get_week_start_from_label(selected_month, selected_semaine, week_ranges)
+        for jour in JOURS:
+            for c in CRENEAUX_JOUR:
+                key = f"{selected_semaine}-{jour}-{c}"
+                d = day_date(week_start, JOURS.index(jour))
+                holiday = True if (d and is_holiday(d)) else False
+                occ = set()
+                if not holiday:
+                    for f, fd in parsed['schedule'].items():
+                        s = fd['slots'].get(key)
+                        if s and s[0]:
+                            occ.add(s[1].replace(' (CONFLIT NON RESOLU)','').replace(' (Conflit)',''))
+                libres = sorted(list(set(parsed['salles']) - occ))
+                synth.append({'Jour': jour, 'Créneau': c, 'Horaire': HORAIRES[c], 'Nb Salles Libres': len(libres), 'Salles Disponibles': ', '.join(libres) if libres else 'Aucune'})
+        st.dataframe(pd.DataFrame(synth), use_container_width=True)
+
+    with tab5:
+        st.markdown('<div class="section-header">📈 Analyse de la Charge par Groupe</div>', unsafe_allow_html=True)
+        st.info(f"📅 Analyse pour : **{selected_month} - {selected_semaine}**")
+
+        charge_groupes = []
+        for groupe in parsed['groupes']:
+            heures_total = 0
+            nb_creneaux = 0
             for jour in JOURS:
-                for c in CRENEAUX_JOUR:
-                    key = f"{selected_semaine}-{jour}-{c}"
-                    d = day_date(week_start, JOURS.index(jour))
-                    holiday = True if (d and is_holiday(d)) else False
-                    occ = set()
-                    if not holiday:
-                        for f, fd in parsed['schedule'].items():
-                            s = fd['slots'].get(key)
-                            if s and s[0]:
-                                occ.add(s[1].replace(' (CONFLIT NON RESOLU)','').replace(' (Conflit)',''))
-                    libres = sorted(list(set(parsed['salles']) - occ))
-                    synth.append({'Jour': jour, 'Créneau': c, 'Horaire': HORAIRES[c], 'Nb Salles Libres': len(libres), 'Salles Disponibles': ', '.join(libres) if libres else 'Aucune'})
-            st.dataframe(pd.DataFrame(synth), use_container_width=True)
+                for creneau in CRENEAUX_JOUR:
+                    slot_key = f"{selected_semaine}-{jour}-{creneau}"
+                    for formateur, f_data in parsed['schedule'].items():
+                        slot_data = f_data['slots'].get(slot_key)
+                        if slot_data and slot_data[0] == groupe:
+                            heures_total += SLOT_DURATIONS[creneau]
+                            nb_creneaux += 1
+                            break
+            charge_groupes.append({'Groupe': groupe, 'Heures de Formation': heures_total, 'Nombre de Créneaux': nb_creneaux})
 
-with tab5:
-    st.markdown('<div class="section-header">📈 Charge par Groupe</div>', unsafe_allow_html=True)
-    if not parsed:
-        st.info("Aucune donnée importée : analyse de charge non disponible.")
-    else:
-        if not selected_semaine:
-            st.info("Sélectionnez une semaine définie pour effectuer l'analyse de charge.")
+        if not charge_groupes:
+            st.info("Aucune donnée de charge disponible pour la semaine sélectionnée.")
         else:
-            charge_groupes = []
-            for groupe in parsed['groupes']:
-                heures_total = 0
-                nb_creneaux = 0
-                for jour in JOURS:
-                    for creneau in CRENEAUX_JOUR:
-                        slot_key = f"{selected_semaine}-{jour}-{creneau}"
-                        for formateur, f_data in parsed['schedule'].items():
-                            slot_data = f_data['slots'].get(slot_key)
-                            if slot_data and slot_data[0] == groupe:
-                                heures_total += SLOT_DURATIONS[creneau]
-                                nb_creneaux += 1
-                                break
-                charge_groupes.append({'Groupe': groupe, 'Heures de Formation': heures_total, 'Nombre de Créneaux': nb_creneaux})
-
-            if not charge_groupes:
-                st.info("Aucune donnée de charge disponible pour la semaine sélectionnée.")
+            df_charge = pd.DataFrame(charge_groupes)
+            if 'Heures de Formation' not in df_charge.columns:
+                st.warning("La colonne 'Heures de Formation' est manquante dans les données ; affichage interrompu.")
+                st.dataframe(df_charge, use_container_width=True)
             else:
-                df_charge = pd.DataFrame(charge_groupes).sort_values('Heures de Formation', ascending=False)
+                df_charge = df_charge.sort_values('Heures de Formation', ascending=False)
                 moyenne_heures = df_charge['Heures de Formation'].mean()
                 col_met1, col_met2, col_met3, col_met4 = st.columns(4)
                 with col_met1:
@@ -1225,9 +1179,9 @@ with tab5:
                     st.metric("Charge Maximale", f"{df_charge['Heures de Formation'].max():.1f}h")
 
                 import plotly.graph_objects as go
+                colors = []
                 seuil_bas = moyenne_heures * 0.85
                 seuil_haut = moyenne_heures * 1.15
-                colors = []
                 for heures in df_charge['Heures de Formation']:
                     if heures > seuil_haut:
                         colors.append('#d32f2f')
@@ -1239,15 +1193,39 @@ with tab5:
                 fig.add_hline(y=moyenne_heures, line_dash="dash", line_color="#1e5631", annotation_text=f"Moyenne: {moyenne_heures:.1f}h", annotation_position="right")
                 fig.add_hline(y=seuil_haut, line_dash="dot", line_color="#d32f2f", opacity=0.5)
                 fig.add_hline(y=seuil_bas, line_dash="dot", line_color="#388e3c", opacity=0.5)
-                fig.update_layout(title={'text': f'Charge Horaire par Groupe - {active_month_label or imported_month_choice} {selected_semaine}', 'x': 0.5}, xaxis_title='Groupes', yaxis_title='Heures de Formation', plot_bgcolor='white', paper_bgcolor='#f8faf9', height=500, showlegend=False, xaxis=dict(tickangle=-45, gridcolor='lightgray'), yaxis=dict(gridcolor='lightgray'))
+                fig.update_layout(title={'text': f'Charge Horaire par Groupe - {selected_month} {selected_semaine}', 'x': 0.5}, xaxis_title='Groupes', yaxis_title='Heures de Formation', plot_bgcolor='white', paper_bgcolor='#f8faf9', height=500, showlegend=False, xaxis=dict(tickangle=-45, gridcolor='lightgray'), yaxis=dict(gridcolor='lightgray'))
                 st.plotly_chart(fig, use_container_width=True)
-
-                df_charge['Catégorie'] = df_charge['Heures de Formation'].apply(lambda x: "🔴 Trop Chargé" if x > seuil_haut else ("🟡 Chargé" if x >= seuil_bas else "🟢 Normal"))
-                df_charge['Écart/Moyenne'] = (df_charge['Heures de Formation'] - moyenne_heures).apply(lambda x: f"{x:+.1f}h")
-                st.dataframe(df_charge, use_container_width=True)
-
                 st.markdown("---")
-                if st.button("📥 Exporter l'Analyse de Charge (Excel)"):
+                def categoriser_charge_moyenne(heures, moyenne, seuil_bas, seuil_haut):
+                    if heures > seuil_haut:
+                        return "🔴 Trop Chargé"
+                    elif heures >= seuil_bas and heures <= seuil_haut:
+                        return "🟡 Chargé"
+                    else:
+                        return "🟢 Normal"
+                df_charge['Catégorie'] = df_charge['Heures de Formation'].apply(lambda x: categoriser_charge_moyenne(x, moyenne_heures, seuil_bas, seuil_haut))
+                df_charge['Écart/Moyenne'] = df_charge['Heures de Formation'] - moyenne_heures
+                df_charge['Écart/Moyenne'] = df_charge['Écart/Moyenne'].apply(lambda x: f"{x:+.1f}h")
+                st.dataframe(df_charge, use_container_width=True)
+                st.markdown("---")
+                st.info(f"""
+                **Légende:**
+                - 🔴 **Trop Chargé**: > {seuil_haut:.1f}h (au-dessus de +15% de la moyenne)
+                - 🟡 **Chargé**: {seuil_bas:.1f}h - {seuil_haut:.1f}h (proche de la moyenne ±15%)
+                - 🟢 **Normal**: < {seuil_bas:.1f}h (inférieur de -15% de la moyenne - Pas chargé)
+                """)
+                col_stat1, col_stat2, col_stat3 = st.columns(3)
+                with col_stat1:
+                    nb_trop_charge = len(df_charge[df_charge['Heures de Formation'] > seuil_haut])
+                    st.markdown(f"""<div class="metric-card" style="border-left-color: #d32f2f;"><div class="metric-value">{nb_trop_charge}</div><div class="metric-label">🔴 Trop Chargés<br/>(Au-dessus moyenne)</div></div>""", unsafe_allow_html=True)
+                with col_stat2:
+                    nb_charge = len(df_charge[(df_charge['Heures de Formation'] >= seuil_bas) & (df_charge['Heures de Formation'] <= seuil_haut)])
+                    st.markdown(f"""<div class="metric-card" style="border-left-color: #fbc02d;"><div class="metric-value">{nb_charge}</div><div class="metric-label">🟡 Chargés<br/>(Proche moyenne)</div></div>""", unsafe_allow_html=True)
+                with col_stat3:
+                    nb_normal = len(df_charge[df_charge['Heures de Formation'] < seuil_bas])
+                    st.markdown(f"""<div class="metric-card" style="border-left-color: #388e3c;"><div class="metric-value">{nb_normal}</div><div class="metric-label">🟢 Normaux<br/>(En bas de la moyenne - Pas chargé)</div></div>""", unsafe_allow_html=True)
+                st.markdown("---")
+                if st.button("📥 Exporter l'Analyse de Charge (Excel)", key="btn_export_charge"):
                     wb_charge = openpyxl.Workbook()
                     ws = wb_charge.active
                     ws.title = sanitize_sheet_title("Charge_Groupes")
@@ -1257,7 +1235,7 @@ with tab5:
                     title_font = Font(bold=True, size=14, color="1e5631")
                     header_fill = PatternFill(start_color="2d8659", end_color="2d8659", fill_type="solid")
                     center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
-                    ws['A1'] = f'ANALYSE DE CHARGE PAR GROUPE - {active_month_label or imported_month_choice} {selected_semaine}'
+                    ws['A1'] = f'ANALYSE DE CHARGE PAR GROUPE - {selected_month} {selected_semaine}'
                     ws.merge_cells('A1:E1'); ws['A1'].font = title_font; ws['A1'].alignment = center_align; ws.row_dimensions[1].height = 25
                     ws['A2'] = f'Moyenne: {moyenne_heures:.1f}h | Seuils: Normal < {seuil_bas:.1f}h | Chargé: {seuil_bas:.1f}h-{seuil_haut:.1f}h | Trop Chargé > {seuil_haut:.1f}h'
                     ws.merge_cells('A2:E2'); ws['A2'].alignment = center_align; ws.row_dimensions[2].height = 20
@@ -1271,7 +1249,7 @@ with tab5:
                             ws[f'{col}{row}'].border = border_thin; ws[f'{col}{row}'].alignment = center_align
                         row += 1
                     excel_bytes = excel_to_bytes(wb_charge)
-                    st.download_button("💾 Télécharger l'Analyse", excel_bytes, f"Charge_Groupes_{active_month_label or imported_month_choice}_{selected_semaine}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+                    st.download_button("💾 Télécharger l'Analyse", excel_bytes, f"Charge_Groupes_{selected_month}_{selected_semaine}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
 st.markdown("---")
-st.markdown("<div style='text-align:center;color:#666;padding:1rem;'>Mode libre — mois et semaines neutres. Importez un fichier pour lier des données réelles.</div>", unsafe_allow_html=True)
+st.markdown("<div style='text-align:center;color:#666;padding:1rem;'>Développé par ISMAILI ALAOUI Mohamed — CFP TLRA/IFMLT</div>", unsafe_allow_html=True)
