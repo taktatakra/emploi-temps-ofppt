@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Streamlit app dérivé du code partagé par l'utilisateur, modifié uniquement pour
-# ne PAS présélectionner automatiquement le mois et la semaine (placeholder "-- Choisir --").
+# ne PAS présélectionner automatiquement le mois et la semaine (placeholder "-- Choisir --")
+# et pour afficher les libellés de semaine sous la forme neutre "DD/MM/YYYY → DD/MM/YYYY".
 # Le reste du code source principal est conservé (logique, exports, résolution de conflits).
 #
 # Usage: streamlit run app.py
@@ -359,21 +360,27 @@ def get_week_start_from_label(mois_label, semaine_label, week_ranges):
             return (first_monday + timedelta(weeks=idx)).date()
     return None
 
-# Helper: format week display label (non-intrusive)
+# Minimal update: display only the date range "DD/MM/YYYY → DD/MM/YYYY" for weeks
 def format_week_display_label(sem_label, week_ranges):
     """
-    Retourne un libellé lisible pour une semaine (ex: "S2 — 03/11/2025 → 08/11/2025").
-    Si la semaine n'a pas de plage dans week_ranges, renvoie simplement sem_label.
+    Affiche uniquement la plage de dates pour la semaine, par exemple:
+    "01/12/2025 → 06/12/2025".
+    Conserve les placeholders inchangés (ex: "-- Choisir --").
     """
     if not sem_label:
+        return sem_label
+    if isinstance(sem_label, str) and sem_label.strip().startswith("--"):
         return sem_label
     if week_ranges and sem_label in week_ranges:
         s = week_ranges[sem_label]['start']
         e = week_ranges[sem_label]['end']
         try:
-            return f"{sem_label} — {s.strftime('%d/%m/%Y')} → {e.strftime('%d/%m/%Y')}"
+            return f"{s.strftime('%d/%m/%Y')} → {e.strftime('%d/%m/%Y')}"
         except Exception:
-            return sem_label
+            try:
+                return f"{str(s)} → {str(e)}"
+            except Exception:
+                return sem_label
     return sem_label
 
 def is_holiday(day_date):
@@ -981,7 +988,7 @@ else:
             "📆 Semaine (plage de dates)",
             weeks_options,
             index=0,
-            format_func=lambda x: x if x.startswith("--") else format_week_display_label(x, week_ranges)
+            format_func=lambda x: x if (isinstance(x, str) and x.startswith("--")) else format_week_display_label(x, week_ranges)
         )
         if selected_semaine == "-- Choisir une semaine --":
             st.info("Aucune semaine sélectionnée — sélectionnez explicitement une semaine pour continuer.")
