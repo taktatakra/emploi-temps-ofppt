@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Streamlit app dérivé du code partagé par l'utilisateur, modifié pour remplacer S1/S2/S3/S4
-# par des plages de dates exactes détectées dans chaque onglets (ou saisies manuellement).
+# par des plages de dates exactes détectées dans chaque onglets (ou saisies/générées automatiquement).
 # Correction: gestion des titres de feuilles invalides pour openpyxl (sanitize_sheet_title).
 # Modification: Utilisation du logo local Logo_ofppt.png dans l'interface
 #
@@ -181,6 +181,49 @@ def find_header_row(df):
             return idx
     return None
 
+# --- WEEK RANGE GENERATION & DISPLAY HELPERS ---
+def generate_week_ranges_for_month(mois_label):
+    """
+    Génère un dictionnaire week_ranges pour le mois donné si aucune plage
+    n'a été détectée dans la feuille.
+    Clés internes: 'S1','S2',... ; valeurs: {'start': date, 'end': date}
+    - start = lundi d'une semaine (ou premier lundi >= 1er du mois)
+    - end = start + 5 jours (lundi -> samedi inclus)
+    """
+    mnum = MONTH_TO_NUMBER.get(mois_label)
+    if not mnum:
+        return {}
+    # choisir année: si mois <= 7 => année académique 2026 (jan-juil 2026), sinon 2025
+    year = 2026 if mnum <= 7 else 2025
+    first_day = datetime(year, mnum, 1).date()
+    # retrouver premier lundi du mois (ou le premier jour s'il est déjà lundi)
+    offset = (0 - first_day.weekday()) % 7
+    first_monday = first_day + timedelta(days=offset)
+    # construire semaines jusqu'à couvrir tout le mois (incluant chevauchements en fin de mois)
+    week_ranges = {}
+    cur = first_monday
+    idx = 1
+    # on limite à 6 semaines max pour éviter boucles infinies
+    while idx <= 6 and (cur.month == mnum or (cur - timedelta(days=1)).month == mnum):
+        start = cur
+        end = start + timedelta(days=5)  # lundi -> samedi
+        week_ranges[f"S{idx}"] = {'start': start, 'end': end}
+        cur = cur + timedelta(weeks=1)
+        idx += 1
+    return week_ranges
+
+def format_week_display_label(sem_label, week_ranges):
+    """
+    Renvoie un libellé neutre et lisible pour la semaine :
+    ex: "S2 — 03/11/2025 → 08/11/2025"
+    Garde la clé interne (S2) inchangée pour la logique.
+    """
+    if sem_label in week_ranges:
+        s = week_ranges[sem_label]['start']
+        e = week_ranges[sem_label]['end']
+        return f"{sem_label} — {s.strftime('%d/%m/%Y')} → {e.strftime('%d/%m/%Y')}"
+    return sem_label
+
 @st.cache_data(show_spinner=False)
 def parse_schedule_sheet(df, sheet_name):
     month_name = extract_month_name_from_sheet(sheet_name)
@@ -207,8 +250,13 @@ def parse_schedule_sheet(df, sheet_name):
         semaines = [it[0] for it in ordered]
         week_ranges = {it[0]: {'start': it[1], 'end': it[2]} for it in ordered}
     else:
-        semaines = FALLBACK_SEMAINES.copy()
-        week_ranges = {}
+        # Générer des week_ranges neutres pour le mois si rien trouvé dans l'onglet
+        week_ranges = generate_week_ranges_for_month(month_label)
+        if week_ranges:
+            semaines = list(sorted(week_ranges.keys(), key=lambda x: int(re.sub(r'\D', '', x) or 0)))
+        else:
+            semaines = FALLBACK_SEMAINES.copy()
+            week_ranges = {}
 
     col_form = -1
     for i, val in enumerate(header_row):
@@ -791,7 +839,7 @@ def create_excel_groupe_semaine(groupe, schedule_data, semaine_label, mois_label
 
     title_text = 'EMPLOI DU TEMPS PAR GROUPE : FORMATION HYBRIDE - V 1.0'
     heures_val = compute_hours_for_groupe(schedule_data, groupe, semaine_label, mois_label, week_ranges)
-    heures_text = f'MASSE HORAIRE: {heures_val:.1f}H/SEMAINE'
+    heures_text = f' MASS E HORAIRE: {heures_val:.1f}H/SEMAINE'
     left_meta = [('A5', 'CFP TLRA/IFMLT'),
                  ('A6', f'Groupe: {groupe}'),
                  ('A7', f'Mois: {mois_label}'),
@@ -949,7 +997,14 @@ else:
     with col2:
         parsed = resolved[selected_month]
         semaines_list = parsed.get('semaines', FALLBACK_SEMAINES)
-        selected_semaine = st.selectbox("📆 Semaine (plage de dates)", semaines_list, index=0)
+        week_ranges = parsed.get('week_ranges', {})
+        # Affiche un libellé descriptif tout en gardant la valeur interne (ex: 'S2')
+        selected_semaine = st.selectbox(
+            "📆 Semaine (plage de dates)",
+            semaines_list,
+            index=0,
+            format_func=lambda x: format_week_display_label(x, week_ranges)
+        )
     week_ranges = parsed.get('week_ranges', {})
 
     week_start = get_week_start_from_label(selected_month, selected_semaine, week_ranges)
